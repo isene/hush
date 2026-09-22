@@ -1,6 +1,6 @@
 [package]
 name = "hush"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A voice call that sends nothing while you are quiet"
 license = "Unlicense"
@@ -10,12 +10,13 @@ authors = ["Geir Isene <g@isene.com>"]
 [dependencies]
 audiopus = { version = "0.2", optional = true }
 crust = { version = "0.1", path = "../crust", package = "fe2o3-crust", optional = true }
+glow = { version = "0.1", path = "../glow", package = "fe2o3-glow", optional = true }
 
 [features]
 # The caller needs Opus and a terminal library. The relay needs neither,
 # so a server can build it with nothing else installed.
 default = ["caller"]
-caller = ["dep:audiopus", "dep:crust"]
+caller = ["dep:audiopus", "dep:crust", "dep:glow"]
 
 [[bin]]
 name = "hush"

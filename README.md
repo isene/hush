@@ -35,6 +35,27 @@ PipeWire ships the canceller that browsers use, and hush borrows it for the leng
 
 Headphones are still the safer answer on a laptop with loud speakers.
 
+## The picture
+
+No camera runs unless you ask for one.
+
+```bash
+hush kitchen --video             # from /dev/video0
+hush kitchen --video /dev/video2 # from another camera
+hush kitchen --video test        # a made-up moving picture, no camera needed
+```
+
+`v` stops the camera and starts it again. Stopping kills it, so the light goes out and nothing is encoded.
+
+The same idea as the sound gate runs here. Frames that look like the one before are thrown away before the encoder sees them, so a person sitting still sends nothing.
+
+- A still scene at 480x360: one picture, 259 bytes, for four seconds.
+- A moving scene: around 140 kbit/s.
+- Encoded on the graphics chip where there is one, so the processor stays cold. Measured over a call: the sending end used 14% of one core, the receiving end 2%.
+- A picture is bigger than a packet, so it goes in pieces. A piece that never arrives costs that one picture, and the next whole one replaces it.
+
+The far end's picture is drawn in real pixels, which needs a terminal that shows them (glass, kitty, WezTerm). Anywhere else the call is sound only.
+
 ## The relay
 
 Two people at home are each behind a router that will not accept a call from outside. So neither dials the other. Both send to a relay on a machine with a real address, and the relay passes the packets on.
@@ -49,9 +70,12 @@ The relay is a binary of its own. It needs nothing but Rust, and never touches t
 cargo build --release --no-default-features --bin hush-relay
 ```
 
-Check out [crust](https://github.com/isene/crust) beside this repo first.
-The caller needs it, and Cargo wants the folder there even when the
-relay is built without it.
+Check out [crust](https://github.com/isene/crust) and
+[glow](https://github.com/isene/glow) beside this repo first. The caller
+needs them, and Cargo wants the folders there even when the relay is
+built without them.
+
+A relay built before pictures existed passes sound only, so rebuild it.
 
 Put its address in `~/.hush`, one line:
 

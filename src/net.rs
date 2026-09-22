@@ -19,6 +19,7 @@ pub const LEAVE: u8 = 2;
 pub const AUDIO: u8 = 3;
 pub const PING: u8 = 4;
 pub const WHO: u8 = 5;
+pub const VIDEO: u8 = 6;
 
 /// The longest name anyone can take.
 pub const NAME_MAX: usize = 20;
@@ -73,9 +74,30 @@ pub fn audio(room: &str, name: &str, seq: u32, opus: &[u8]) -> Vec<u8> {
 /// Where the sound starts in an AUDIO packet.
 pub const AUDIO_HEAD: usize = 1 + ROOM_LEN + NAME_MAX + 4;
 
+/// A piece of a picture: the room, who is looking at the camera, which
+/// picture this is, which piece of it, and how many pieces there are.
+/// A picture is far too big for one packet, so it goes in pieces.
+pub fn video(room: &str, name: &str, frame: u32, index: u16, count: u16, chunk: &[u8]) -> Vec<u8> {
+    let mut p = vec![VIDEO];
+    p.extend(fixed(room, ROOM_LEN));
+    p.extend(fixed(name, NAME_MAX));
+    p.extend(frame.to_le_bytes());
+    p.extend(index.to_le_bytes());
+    p.extend(count.to_le_bytes());
+    p.extend(chunk);
+    p
+}
+
+/// Where the picture starts in a VIDEO packet.
+pub const VIDEO_HEAD: usize = 1 + ROOM_LEN + NAME_MAX + 4 + 2 + 2;
+
+/// The most of a picture that fits in one packet.
+pub const CHUNK_MAX: usize = PACKET_MAX - VIDEO_HEAD;
+
 /// What a client made of a packet that arrived.
 pub enum In {
     Speech { from: String, seq: u32, opus: Vec<u8> },
+    Picture { from: String, frame: u32, index: u16, count: u16, chunk: Vec<u8> },
     Who(Vec<String>),
     Other,
 }
@@ -95,6 +117,14 @@ pub fn parse(buf: &[u8]) -> In {
                 buf[AUDIO_HEAD - 1],
             ]);
             In::Speech { from, seq, opus: buf[AUDIO_HEAD..].to_vec() }
+        }
+        VIDEO if buf.len() > VIDEO_HEAD => {
+            let from = unfixed(&buf[1 + ROOM_LEN..1 + ROOM_LEN + NAME_MAX]);
+            let n = 1 + ROOM_LEN + NAME_MAX;
+            let frame = u32::from_le_bytes([buf[n], buf[n + 1], buf[n + 2], buf[n + 3]]);
+            let index = u16::from_le_bytes([buf[n + 4], buf[n + 5]]);
+            let count = u16::from_le_bytes([buf[n + 6], buf[n + 7]]);
+            In::Picture { from, frame, index, count, chunk: buf[VIDEO_HEAD..].to_vec() }
         }
         WHO => {
             let names = buf[1..]
@@ -157,7 +187,7 @@ pub fn relay(port: u16) -> std::io::Result<()> {
             }
         }
 
-        if kind == AUDIO {
+        if kind == AUDIO || kind == VIDEO {
             for m in members.iter() {
                 if m.addr != from {
                     let _ = sock.send_to(&buf[..n], m.addr);
@@ -223,6 +253,19 @@ mod tests {
             In::Who(names) => assert_eq!(names, vec!["geir", "alice"]),
             _ => panic!("the room list came back as something else"),
         }
+    }
+
+    #[test]
+    fn a_piece_of_a_picture_reads_back_as_it_was_sent() {
+        let p = video("kitchen", "geir", 12, 1, 4, &[3, 3, 3]);
+        match parse(&p) {
+            In::Picture { from, frame, index, count, chunk } => {
+                assert_eq!((from.as_str(), frame, index, count), ("geir", 12, 1, 4));
+                assert_eq!(chunk, vec![3, 3, 3]);
+            }
+            _ => panic!("a piece of a picture came back as something else"),
+        }
+        assert!(CHUNK_MAX > 1000, "a piece worth sending fits in a packet");
     }
 
     #[test]

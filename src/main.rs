@@ -14,6 +14,7 @@
 //! to a relay with a real address. Run one with `hush --relay`.
 
 mod audio;
+mod video;
 
 use hush::net;
 
@@ -26,7 +27,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 const RUST_RGB: (u8, u8, u8) = (247, 76, 0);
@@ -35,6 +38,41 @@ const LIVE_RGB: (u8, u8, u8) = (120, 230, 140);
 const IDLE_RGB: (u8, u8, u8) = (110, 110, 125);
 const BAR_BG: (u8, u8, u8) = (38, 38, 38);
 const DIM_RGB: (u8, u8, u8) = (140, 140, 150);
+
+/// The far end's last picture, as plain pixels, and whether the screen
+/// has drawn it yet.
+struct Seen {
+    pixels: Vec<u8>,
+    fresh: bool,
+}
+
+/// Everything the picture needs, in one place: where our own comes from,
+/// how big the far end's is drawn, the last one that arrived, and the
+/// camera itself while it runs.
+struct Vid {
+    /// A device path, the word `test`, or nothing when no camera was asked for.
+    source: Option<String>,
+    /// The size the far end's picture is drawn at, in pixels and in cells.
+    px: (usize, usize),
+    cells: (u16, u16),
+    seen: Mutex<Seen>,
+    cam: Mutex<Option<Child>>,
+}
+
+impl Vid {
+    /// Is our own camera running right now?
+    fn on(&self) -> bool {
+        self.cam.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Stop the camera. The thread sending pictures ends with it.
+    fn stop(&self) {
+        if let Some(mut c) = self.cam.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
 
 /// What the call knows about itself, for the screen.
 struct State {
@@ -76,6 +114,9 @@ fn main() {
     // naming one says which microphone to use, and the canceller's is
     // a different one.
     let mut want_aec = true;
+    // No camera unless one is asked for. `test` is a moving picture that
+    // needs no camera, which is how a call is tried out.
+    let mut camera: Option<String> = None;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -104,6 +145,13 @@ fn main() {
                 i += 1;
             }
             "--no-aec" => want_aec = false,
+            "--video" => {
+                let next = args.get(i + 1).filter(|v| !v.starts_with('-')).cloned();
+                if next.is_some() {
+                    i += 1;
+                }
+                camera = Some(next.unwrap_or_else(|| "/dev/video0".into()));
+            }
             "-v" | "--version" => {
                 println!("hush {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -144,7 +192,7 @@ fn main() {
         out = audio::AEC_OUT.to_string();
     }
 
-    if let Err(e) = call(&server, &room, &name, &mic, &out, aec.is_some()) {
+    if let Err(e) = call(&server, &room, &name, &mic, &out, aec.is_some(), camera) {
         eprintln!("hush: {e}");
         std::process::exit(1);
     }
@@ -176,13 +224,23 @@ fn help() {
     println!("  --mic DEVICE  an ALSA device other than the default");
     println!("  --out DEVICE  likewise for the speaker");
     println!("  --no-aec      leave the echo canceller out");
+    println!("  --video [DEV] send a picture too, from DEV (default /dev/video0)");
+    println!("                `--video test` sends a test picture and needs no camera");
     println!("  --relay PORT  be the relay instead of joining a call");
     println!();
     println!("PipeWire's echo canceller is used when it is there, so the far end");
     println!("does not hear itself. Headphones are still the safer answer.");
 }
 
-fn call(server: &str, room: &str, name: &str, mic: &str, out: &str, aec: bool) -> std::io::Result<()> {
+fn call(
+    server: &str,
+    room: &str,
+    name: &str,
+    mic: &str,
+    out: &str,
+    aec: bool,
+    camera: Option<String>,
+) -> std::io::Result<()> {
     let addr = server
         .to_socket_addrs()?
         .next()
@@ -210,6 +268,22 @@ fn call(server: &str, room: &str, name: &str, mic: &str, out: &str, aec: bool) -
     });
     let going = Arc::new(AtomicBool::new(true));
 
+    // How big the far end's picture is drawn. Whole cells, and close to
+    // the shape a camera gives, so a face is not stretched.
+    let (cell_w, cell_h) = glow::get_cell_size();
+    let cols = 40u16;
+    let rows = (((cols as usize * cell_w as usize) * 3 / 4) as u16 / cell_h.max(1)).max(4);
+    let px = glow::cell_box(cols, rows);
+    let vid = Arc::new(Vid {
+        source: camera,
+        px,
+        cells: (cols, rows),
+        seen: Mutex::new(Seen { pixels: Vec::new(), fresh: false }),
+        cam: Mutex::new(None),
+    });
+    // Pressing v asks for the camera back after it has been stopped.
+    let (ask, asked) = mpsc::channel::<()>();
+
     // The sound coming back, one queue of frames waiting to be played.
     let waiting: Arc<Mutex<Vec<Vec<i16>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -220,11 +294,17 @@ fn call(server: &str, room: &str, name: &str, mic: &str, out: &str, aec: bool) -
     });
     let listen = std::thread::spawn({
         let (sock, state, tally, going, waiting) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone(), waiting.clone());
-        move || hear(sock, state, tally, going, waiting)
+        let vid = vid.clone();
+        move || hear(sock, state, tally, going, waiting, vid)
     });
     let play = std::thread::spawn({
         let (going, waiting, out) = (going.clone(), waiting.clone(), out.to_string());
         move || play_back(&out, aec, waiting, going)
+    });
+    let watch = std::thread::spawn({
+        let (sock, tally, going, vid) = (sock.try_clone()?, tally.clone(), going.clone(), vid.clone());
+        let (room, name) = (room.to_string(), name.to_string());
+        move || watch(sock, &room, &name, vid, tally, going, asked)
     });
     let beat = std::thread::spawn({
         let (sock, going) = (sock.try_clone()?, going.clone());
@@ -239,14 +319,19 @@ fn call(server: &str, room: &str, name: &str, mic: &str, out: &str, aec: bool) -
         }
     });
 
-    screen(room, name, server, aec, &state, &tally, &going);
+    screen(room, name, server, aec, &state, &tally, &going, &vid, &ask);
 
     going.store(false, Ordering::Relaxed);
-    let _ = sock.send(&net::leave(room, name));
+    vid.stop();
+    drop(ask);
     let _ = talk.join();
     let _ = listen.join();
     let _ = play.join();
+    let _ = watch.join();
     let _ = beat.join();
+    // Last of all, once no thread can send another packet: a keepalive
+    // arriving after the goodbye would put us back in the room.
+    let _ = sock.send(&net::leave(room, name));
     Ok(())
 }
 
@@ -321,6 +406,7 @@ fn hear(
     tally: Arc<Tally>,
     going: Arc<AtomicBool>,
     waiting: Arc<Mutex<Vec<Vec<i16>>>>,
+    vid: Arc<Vid>,
 ) {
     let mut dec = match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
         Ok(d) => d,
@@ -330,6 +416,9 @@ fn hear(
     let mut buf = vec![0u8; net::PACKET_MAX];
     // The last frame number each speaker sent, so a gap can be counted.
     let mut last: BTreeMap<String, u32> = BTreeMap::new();
+    // Nothing of the picture side exists until a picture actually comes.
+    let mut joining = video::Joining::new();
+    let mut into_decoder: Option<std::process::ChildStdin> = None;
     while going.load(Ordering::Relaxed) {
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
@@ -363,6 +452,19 @@ fn hear(
                     q.push(frame);
                 }
             }
+            net::In::Picture { frame, index, count, chunk, .. } => {
+                tally.recv_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                if into_decoder.is_none() {
+                    into_decoder = start_decoder(&vid, &going);
+                }
+                if let Some(whole) = joining.take(frame, index, count, chunk) {
+                    if let Some(sink) = into_decoder.as_mut() {
+                        if sink.write_all(&whole).is_err() {
+                            into_decoder = None;
+                        }
+                    }
+                }
+            }
             net::In::Who(names) => {
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 s.here = names;
@@ -370,6 +472,93 @@ fn hear(
             net::In::Other => {}
         }
     }
+}
+
+/// Start decoding the far end's pictures, and read them into `vid` as
+/// they come out. Called on the first picture and not before, so a call
+/// without video never starts any of this.
+fn start_decoder(vid: &Arc<Vid>, going: &Arc<AtomicBool>) -> Option<std::process::ChildStdin> {
+    let mut child = video::decoder(vid.px.0, vid.px.1).ok()?;
+    let sink = child.stdin.take()?;
+    let mut src = child.stdout.take()?;
+    let (vid, going) = (vid.clone(), going.clone());
+    std::thread::spawn(move || {
+        let each = vid.px.0 * vid.px.1 * 3;
+        let mut frame = vec![0u8; each];
+        while going.load(Ordering::Relaxed) {
+            if src.read_exact(&mut frame).is_err() {
+                break;
+            }
+            let mut seen = vid.seen.lock().unwrap_or_else(|e| e.into_inner());
+            seen.pixels.clear();
+            seen.pixels.extend_from_slice(&frame);
+            seen.fresh = true;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    Some(sink)
+}
+
+/// Send our own pictures while the camera runs, and wait to be asked
+/// again once it has been stopped.
+fn watch(
+    sock: UdpSocket,
+    room: &str,
+    name: &str,
+    vid: Arc<Vid>,
+    tally: Arc<Tally>,
+    going: Arc<AtomicBool>,
+    asked: mpsc::Receiver<()>,
+) {
+    let Some(source) = vid.source.clone() else {
+        return;
+    };
+    let mut run = true;
+    while going.load(Ordering::Relaxed) {
+        if run {
+            send_pictures(&sock, room, name, &source, &vid, &tally, &going);
+        }
+        // Nothing wakes this up but a key asking for the camera back.
+        run = asked.recv().is_ok();
+    }
+}
+
+/// One camera, from start to stop: each picture in as many pieces as it
+/// takes. Pictures that look like the one before never get here, since
+/// the camera throws them away before encoding them.
+fn send_pictures(
+    sock: &UdpSocket,
+    room: &str,
+    name: &str,
+    source: &str,
+    vid: &Arc<Vid>,
+    tally: &Arc<Tally>,
+    going: &Arc<AtomicBool>,
+) {
+    let Ok(mut child) = video::camera(source) else {
+        return;
+    };
+    let Some(out) = child.stdout.take() else {
+        return;
+    };
+    *vid.cam.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+    let mut pictures = video::Pictures::new(out);
+    let mut id = 0u32;
+    while going.load(Ordering::Relaxed) {
+        let Some(frame) = pictures.next_picture() else {
+            break;
+        };
+        id += 1;
+        let count = frame.chunks(net::CHUNK_MAX).count() as u16;
+        for (i, chunk) in frame.chunks(net::CHUNK_MAX).enumerate() {
+            let packet = net::video(room, name, id, i as u16, count, chunk);
+            if sock.send(&packet).is_ok() {
+                tally.sent_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    vid.stop();
 }
 
 /// Feed the speaker, twenty milliseconds at a time, silence when there
@@ -468,6 +657,8 @@ fn screen(
     state: &Arc<Mutex<State>>,
     tally: &Arc<Tally>,
     going: &Arc<AtomicBool>,
+    vid: &Arc<Vid>,
+    ask: &mpsc::Sender<()>,
 ) {
     Crust::init();
     Crust::set_app_identity("Hush");
@@ -475,6 +666,13 @@ fn screen(
     let mut status = Pane::new(1, rows, cols, 1, 250, 236);
     status.scroll = false;
     let began = Instant::now();
+    // Two image numbers, used in turn: the new picture goes up before the
+    // old one comes down, which is what keeps a moving picture from
+    // flickering. Nothing here runs until a picture arrives.
+    let pixels = glow::Display::new().supported();
+    let mut shown: Option<u32> = None;
+    let mut turn = 0u32;
+    let mut drawn = false;
 
     while going.load(Ordering::Relaxed) {
         {
@@ -507,8 +705,34 @@ fn screen(
                 style::rgb(&format!("{line}{}{right}", " ".repeat(pad)), None, Some(BAR_BG), "")
             );
 
+            // A picture that has arrived since the last pass.
+            if pixels {
+                let mut seen = vid.seen.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.fresh && !seen.pixels.is_empty() {
+                    let id = 90 + turn % 2;
+                    turn += 1;
+                    print!(
+                        "{}{}",
+                        move_to(3, 3),
+                        glow::kitty_frame_rgb(
+                            id,
+                            vid.px.0 as u32,
+                            vid.px.1 as u32,
+                            vid.cells.0,
+                            vid.cells.1,
+                            &seen.pixels
+                        )
+                    );
+                    if let Some(old) = shown.replace(id) {
+                        print!("{}", glow::kitty_forget(old));
+                    }
+                    seen.fresh = false;
+                    drawn = true;
+                }
+            }
+
             let w = (cols as usize).saturating_sub(34).clamp(10, 60);
-            let mut row = 3u16;
+            let mut row = if drawn { 4 + vid.cells.1 } else { 3 };
             let mine = if s.muted {
                 style::rgb("muted", Some((230, 120, 110)), None, "b")
             } else if s.open {
@@ -592,26 +816,48 @@ fn screen(
             );
         }
         status.say(&format!(
-            " {}  {}  {}  {}",
+            " {}  {}  {}  {}  {}",
             style::rgb("m", Some(HEAD_RGB), None, "b"),
             style::dim("mute · q hangs up"),
             style::dim(if aec { "echo cancelled" } else { "no echo cancelling · wear headphones" }),
+            style::dim(match (&vid.source, vid.on()) {
+                (None, _) => "no camera",
+                (Some(_), true) => "v stops the camera",
+                (Some(_), false) => "v starts the camera",
+            }),
             style::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
         ));
         std::io::stdout().flush().ok();
 
-        if let Some(key) = Input::getchr(Some(200)) {
+        // Milliseconds: getchr's own timeout counts in seconds, which left
+        // the screen frozen between keystrokes. A picture wants a look
+        // three times as often as meters do; without video this stays at
+        // five looks a second, which is what the meters need.
+        let wait = if vid.source.is_some() || drawn { 60 } else { 200 };
+        if let Some(key) = Input::getchr_ms(wait) {
             match key.as_str() {
                 "q" | "ESC" => break,
                 "m" => {
                     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.muted = !s.muted;
                 }
+                "v" if vid.source.is_some() => {
+                    // Stopping it kills the camera, so the light goes out
+                    // and nothing encodes. Starting it asks for a new one.
+                    if vid.on() {
+                        vid.stop();
+                    } else {
+                        let _ = ask.send(());
+                    }
+                }
                 _ => {}
             }
         }
     }
     going.store(false, Ordering::Relaxed);
+    if let Some(old) = shown {
+        print!("{}", glow::kitty_forget(old));
+    }
     Crust::cleanup();
 }
 
