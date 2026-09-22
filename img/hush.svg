@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <radialGradient id="back" cx="50%" cy="45%" r="60%">
+      <stop offset="0%" style="stop-color:#23202b"/>
+      <stop offset="100%" style="stop-color:#0a0910"/>
+    </radialGradient>
+    <linearGradient id="voice" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ffb066"/>
+      <stop offset="60%" style="stop-color:#f74c00"/>
+      <stop offset="100%" style="stop-color:#f74c00"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="128" cy="128" r="124" fill="url(#back)"/>
+
+  <!-- a voice, loud on the left and gone on the right: the bars are what
+       is sent, the thin line is silence, which costs nothing -->
+  <g fill="url(#voice)">
+    <rect x="34"  y="112" width="13" height="32"  rx="6.5"/>
+    <rect x="55"  y="88"  width="13" height="80"  rx="6.5"/>
+    <rect x="76"  y="66"  width="13" height="124" rx="6.5"/>
+    <rect x="97"  y="98"  width="13" height="60"  rx="6.5"/>
+    <rect x="118" y="78"  width="13" height="100" rx="6.5"/>
+    <rect x="139" y="106" width="13" height="44"  rx="6.5"/>
+  </g>
+  <rect x="160" y="124" width="62" height="8" rx="4" fill="#f74c00" opacity="0.45"/>
+</svg>
