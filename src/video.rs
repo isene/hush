@@ -57,9 +57,16 @@ pub fn camera(source: &str) -> std::io::Result<Child> {
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"]);
     }
-    // No B-frames, so a picture is ready the moment it is encoded, and
-    // one keyframe at the start rather than every few seconds: a still
-    // scene should cost nothing, and periodic keyframes are not nothing.
+    // The plainest H.264 there is. Browsers decode this one everywhere,
+    // and the terminal end is happy with it either way.
+    cmd.args(["-profile:v", "constrained_baseline", "-level", "31"]);
+    // No B-frames, so a picture is ready the moment it is encoded.
+    //
+    // A keyframe every four seconds, and one whenever somebody new can
+    // only start from one. It costs nothing while the picture stands
+    // still, because then no frame reaches the encoder at all and the
+    // clock it counts by never moves.
+    cmd.args(["-force_key_frames", "expr:gte(t,n_forced*4)"]);
     cmd.args(["-b:v", "400k", "-g", "600", "-bf", "0", "-f", "h264", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

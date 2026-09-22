@@ -58,6 +58,19 @@ The same idea as the sound gate runs here. Frames that look like the one before 
 
 The far end's picture is drawn in real pixels, which needs a terminal that shows them (glass, kitty, WezTerm). Anywhere else the call is sound only.
 
+## In a browser
+
+The same rooms, from a phone or any machine with no hush on it.
+
+Open <https://isene.com/hush/>, type the room and a name, and you are in the call with whoever is there in a terminal.
+
+- The browser gives the microphone, the camera, Opus, H.264 and echo cancellation. None of it has to be built.
+- The same gate runs there: nothing goes out while you are quiet, and a still picture sends nothing.
+- A browser cannot send UDP, so it reaches the relay over a WebSocket instead. The packets are the same bytes.
+- It needs WebCodecs, which Chrome, Edge and Safari 17 have.
+
+The page is one file, `web/index.html`. Serve it anywhere, as long as the relay is reachable at `ws` beside it.
+
 ## The relay
 
 Two people at home are each behind a router that will not accept a call from outside. So neither dials the other. Both send to a relay on a machine with a real address, and the relay passes the packets on.
@@ -65,6 +78,8 @@ Two people at home are each behind a router that will not accept a call from out
 ```bash
 hush-relay 7777           # on a machine both ends can reach
 ```
+
+It listens twice: UDP on that port for the terminal app, and TCP one port up for browsers. Put a web server in front of the second one, so a browser gets it as `wss://`.
 
 The relay is a binary of its own. It needs nothing but Rust, and never touches the sound libraries.
 

@@ -1,6 +1,6 @@
 [package]
 name = "hush"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A voice call that sends nothing while you are quiet"
 license = "Unlicense"
@@ -8,6 +8,9 @@ repository = "https://github.com/isene/hush"
 authors = ["Geir Isene <g@isene.com>"]
 
 [dependencies]
+# The relay also answers browsers, which cannot send UDP. This is the
+# WebSocket handshake and framing, and nothing else.
+tungstenite = "0.24"
 audiopus = { version = "0.2", optional = true }
 crust = { version = "0.1", path = "../crust", package = "fe2o3-crust", optional = true }
 glow = { version = "0.1", path = "../glow", package = "fe2o3-glow", optional = true }

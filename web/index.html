@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hush</title>
+<style>
+  :root { --rust:#f74c00; --warm:#ffb066; --live:#78e68c; --dim:#8c8c96; --bg:#0a0910; --panel:#17161f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:#e8e6ea; font:16px/1.5 system-ui, sans-serif;
+         display:flex; justify-content:center; padding:24px 16px; }
+  main { width:100%; max-width:520px; }
+  h1 { font-size:28px; margin:0 0 4px; color:var(--rust); letter-spacing:.02em; }
+  p.says { margin:0 0 20px; color:var(--dim); }
+  .panel { background:var(--panel); border:1px solid #262433; border-radius:12px; padding:16px; margin-bottom:14px; }
+  label { display:block; font-size:13px; color:var(--dim); margin-bottom:4px; }
+  input { width:100%; padding:10px; margin-bottom:12px; border-radius:8px; border:1px solid #33303f;
+          background:#0f0e15; color:#e8e6ea; font-size:16px; }
+  button { width:100%; padding:12px; border:0; border-radius:8px; background:var(--rust); color:#fff;
+           font-size:16px; font-weight:600; cursor:pointer; }
+  button.off { background:#3a3746; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; align-items:center; gap:10px; margin:10px 0; }
+  .who { width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .meter { flex:1; height:10px; background:#24222e; border-radius:5px; overflow:hidden; position:relative; }
+  .meter i { display:block; height:100%; width:0; background:var(--rust); transition:width .08s linear; }
+  .meter b { position:absolute; top:0; bottom:0; width:2px; background:var(--warm); opacity:.8; }
+  .state { width:70px; font-size:13px; text-align:right; color:var(--dim); }
+  .state.on { color:var(--live); }
+  .tally { font-size:13px; color:var(--dim); }
+  .tally b { color:var(--warm); font-weight:600; }
+  canvas { width:100%; border-radius:10px; background:#000; display:block; }
+  video#self { width:120px; border-radius:8px; background:#000; display:block; margin:10px 0 0 auto;
+               transform:scaleX(-1); }
+  .hide { display:none; }
+  .keys { display:flex; gap:10px; }
+  .keys button { flex:1; }
+  .warn { color:var(--warm); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>hush</h1>
+  <p class="says">A call that sends nothing while you are quiet.</p>
+
+  <div class="panel" id="setup">
+    <label for="room">Room</label>
+    <input id="room" value="kitchen" autocomplete="off">
+    <label for="name">Your name</label>
+    <input id="name" placeholder="who the others see" autocomplete="off">
+    <button id="join">Join the call</button>
+    <p class="warn" id="warn"></p>
+  </div>
+
+  <div class="panel hide" id="call">
+    <div class="row">
+      <span class="who"><b id="me">you</b></span>
+      <span class="meter"><i id="level"></i><b id="mark"></b></span>
+      <span class="state" id="mine">quiet</span>
+    </div>
+    <div id="others"></div>
+    <canvas id="far" class="hide"></canvas>
+    <video id="self" class="hide" muted playsinline></video>
+    <p class="tally" id="tally">nothing sent yet</p>
+    <p class="tally" id="share"></p>
+    <div class="keys">
+      <button id="mute" class="off">Mute</button>
+      <button id="cam" class="off">Camera</button>
+      <button id="leave">Hang up</button>
+    </div>
+  </div>
+</main>
+<script>
+// The same packets the terminal app sends, built by hand. A browser
+// cannot send UDP, so these go over a WebSocket to the relay, which
+// passes them on to everyone else in the room whichever way they came.
+const JOIN = 1, LEAVE = 2, AUDIO = 3, PING = 4, WHO = 5, VIDEO = 6;
+const ROOM_LEN = 12, NAME_MAX = 20;
+const HEAD = 1 + ROOM_LEN + NAME_MAX;
+const AUDIO_HEAD = HEAD + 4;
+const VIDEO_HEAD = HEAD + 4 + 2 + 2;
+const PACKET_MAX = 1200;
+const CHUNK_MAX = PACKET_MAX - VIDEO_HEAD;
+const RATE = 48000, FRAME = 960;      // twenty milliseconds
+
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+function fixed(text, n) {
+  const out = new Uint8Array(n);
+  out.set(enc.encode(text).slice(0, n));
+  return out;
+}
+function unfixed(bytes) {
+  let end = bytes.indexOf(0);
+  return dec.decode(bytes.slice(0, end === -1 ? bytes.length : end));
+}
+function head(kind, room, name, extra) {
+  const p = new Uint8Array(HEAD + extra);
+  p[0] = kind;
+  p.set(fixed(room, ROOM_LEN), 1);
+  p.set(fixed(name, NAME_MAX), 1 + ROOM_LEN);
+  return p;
+}
+
+// The gate, the same one the terminal app uses. It learns what quiet
+// sounds like here, opens at once and closes slowly.
+class Gate {
+  constructor() { this.floor = 0.002; this.left = 0; this.open = false; }
+  speaking(level) {
+    const loud = level > 0.004 && level > this.floor * 2.6;
+    if (level < this.floor) this.floor += (level - this.floor) * 0.25;
+    else this.floor *= 1.004;
+    this.floor = Math.min(0.08, Math.max(0.0005, this.floor));
+    if (loud) this.left = 15; else if (this.left > 0) this.left--;
+    this.open = loud || this.left > 0;
+    return this.open;
+  }
+}
+
+// One worklet does both directions: it hands the microphone up in
+// twenty millisecond frames and plays back whatever is queued.
+const WORKLET = `
+class Both extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.out = [];
+    this.take = new Float32Array(${FRAME});
+    this.have = 0;
+    this.port.onmessage = e => { this.out.push(e.data); if (this.out.length > 12) this.out.shift(); };
+  }
+  process(inputs, outputs) {
+    const mic = inputs[0] && inputs[0][0];
+    if (mic) {
+      for (let i = 0; i < mic.length; i++) {
+        this.take[this.have++] = mic[i];
+        if (this.have === ${FRAME}) { this.port.postMessage(this.take.slice()); this.have = 0; }
+      }
+    }
+    const speaker = outputs[0][0];
+    let want = 0;
+    while (want < speaker.length && this.out.length) {
+      const piece = this.out[0];
+      const n = Math.min(piece.length, speaker.length - want);
+      speaker.set(piece.subarray(0, n), want);
+      want += n;
+      if (n === piece.length) this.out.shift(); else this.out[0] = piece.subarray(n);
+    }
+    return true;
+  }
+}
+registerProcessor('both', Both);
+`;
+
+const $ = id => document.getElementById(id);
+let ws, ctx, node, stream, encoder, decoder, gate = new Gate();
+let room = '', me = '', seq = 0, beat = 0, muted = false;
+let sent = 0, got = 0, frames = 0, spoke = 0, began = 0;
+let here = [], loud = {};
+// video
+let camOn = false, vEnc = null, vDec = null, vTrack = null, vTimer = null;
+let vFrame = 0, joining = null, lastSmall = null, small = null;
+
+function say(what) { $('warn').textContent = what; }
+
+function open(where) {
+  ws = new WebSocket(where);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { ws.send(head(JOIN, room, me, 0)); beat = setInterval(() => ws.send(head(PING, room, me, 0)), 1000); };
+  ws.onmessage = e => took(new Uint8Array(e.data));
+  ws.onclose = () => { if (began) say('the line dropped'); };
+  ws.onerror = () => say('cannot reach the relay');
+}
+
+function took(p) {
+  got += p.length;
+  if (p[0] === WHO) {
+    here = [];
+    for (let i = 1; i + NAME_MAX <= p.length; i += NAME_MAX) {
+      const n = unfixed(p.slice(i, i + NAME_MAX));
+      if (n && n !== me) here.push(n);
+    }
+    drawWho();
+  } else if (p[0] === AUDIO && p.length > AUDIO_HEAD && decoder) {
+    const from = unfixed(p.slice(1 + ROOM_LEN, HEAD));
+    const opus = p.slice(AUDIO_HEAD);
+    loud[from] = Date.now();
+    try {
+      decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: performance.now() * 1000, data: opus }));
+    } catch (e) {}
+  } else if (p[0] === VIDEO && p.length > VIDEO_HEAD) {
+    const v = new DataView(p.buffer, p.byteOffset);
+    const frame = v.getUint32(HEAD, true), index = v.getUint16(HEAD + 4, true), count = v.getUint16(HEAD + 6, true);
+    joinPicture(frame, index, count, p.slice(VIDEO_HEAD));
+  }
+}
+
+function drawWho() {
+  const box = $('others');
+  box.innerHTML = '';
+  if (!here.length) { box.innerHTML = '<p class="tally">waiting for someone else to join this room</p>'; return; }
+  for (const who of here) {
+    const talking = (Date.now() - (loud[who] || 0)) < 400;
+    box.insertAdjacentHTML('beforeend',
+      `<div class="row"><span class="who">${who.replace(/[<&]/g, '')}</span>` +
+      `<span class="meter"><i style="width:${talking ? 70 : 0}%"></i></span>` +
+      `<span class="state ${talking ? 'on' : ''}">${talking ? 'speaking' : 'quiet'}</span></div>`);
+  }
+}
+
+async function start() {
+  room = $('room').value.trim() || 'kitchen';
+  me = $('name').value.trim() || 'someone';
+  if (!window.AudioEncoder) { say('this browser cannot encode Opus; try Chrome, Edge or Safari 17'); return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+    });
+  } catch (e) { say('no microphone: ' + e.message); return; }
+
+  ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
+  node = new AudioWorkletNode(ctx, 'both', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+  ctx.createMediaStreamSource(stream).connect(node);
+  node.connect(ctx.destination);
+  node.port.onmessage = e => mic(e.data);
+
+  encoder = new AudioEncoder({
+    output: chunk => {
+      const opus = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(opus);
+      const p = head(AUDIO, room, me, 4 + opus.length);
+      new DataView(p.buffer).setUint32(AUDIO_HEAD - 4, seq++, true);
+      p.set(opus, AUDIO_HEAD);
+      if (ws && ws.readyState === 1) { ws.send(p); sent += p.length; }
+    },
+    error: e => say('encoder: ' + e.message)
+  });
+  encoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1, bitrate: 24000 });
+
+  decoder = new AudioDecoder({
+    output: data => {
+      const pcm = new Float32Array(data.numberOfFrames);
+      data.copyTo(pcm, { planeIndex: 0, format: 'f32-planar' });
+      node.port.postMessage(pcm);
+      data.close();
+    },
+    error: () => {}
+  });
+  decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
+
+  open(document.body.dataset.relay || relayAddress());
+  began = Date.now();
+  $('setup').classList.add('hide');
+  $('call').classList.remove('hide');
+  $('me').textContent = me;
+  setInterval(tick, 200);
+}
+
+function relayAddress() {
+  const how = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  return how + location.host + location.pathname.replace(/\/?$/, '/') + 'ws';
+}
+
+let when = 0;
+function mic(pcm) {
+  frames++;
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+  const level = Math.sqrt(sum / pcm.length);
+  const open = gate.speaking(level) && !muted;
+  $('level').style.width = Math.min(100, level * 300) + '%';
+  $('mark').style.left = Math.min(100, gate.floor * 2.6 * 300) + '%';
+  $('mine').textContent = muted ? 'muted' : open ? 'sending' : 'quiet';
+  $('mine').className = 'state' + (open ? ' on' : '');
+  if (!open || !encoder || encoder.state !== 'configured') return;
+  spoke++;
+  encoder.encode(new AudioData({
+    format: 'f32-planar', sampleRate: RATE, numberOfFrames: pcm.length,
+    numberOfChannels: 1, timestamp: when, data: pcm
+  }));
+  when += FRAME * 1e6 / RATE;
+}
+
+function total(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' kB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+function tick() {
+  const secs = (Date.now() - began) / 1000;
+  $('tally').innerHTML = `sent <b>${total(sent)}</b> (${total(sent / secs)}/s) &nbsp; received <b>${total(got)}</b> (${total(got / secs)}/s)`;
+  $('share').textContent = `the line carried your voice ${frames ? Math.round(spoke / frames * 100) : 0}% of the time`;
+  drawWho();
+}
+
+// ---- the picture ---------------------------------------------------
+
+function joinPicture(frame, index, count, chunk) {
+  if (!vDec) startDecoder();
+  if (!joining || joining.frame !== frame || joining.pieces.length !== count) {
+    joining = { frame, pieces: new Array(count).fill(null) };
+  }
+  joining.pieces[index] = chunk;
+  if (joining.pieces.some(p => !p)) return;
+  let n = 0;
+  for (const p of joining.pieces) n += p.length;
+  const whole = new Uint8Array(n);
+  let at = 0;
+  for (const p of joining.pieces) { whole.set(p, at); at += p.length; }
+  joining = null;
+  const key = isKey(whole);
+  if (!vDec.ready && !key) return;
+  vDec.ready = true;
+  try {
+    vDec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: performance.now() * 1000, data: whole }));
+  } catch (e) { say('picture: ' + e.message); }
+}
+
+// A picture holding a unit of kind 5, or the settings that come before
+// one, is a keyframe: the first picture a decoder can start from.
+function isKey(bytes) {
+  for (let i = 0; i + 4 < bytes.length; i++) {
+    if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
+      const kind = bytes[i + 3] & 0x1f;
+      if (kind === 5 || kind === 7) return true;
+      if (kind === 1) return false;
+    }
+  }
+  return false;
+}
+
+function startDecoder() {
+  const far = $('far'), paint = far.getContext('2d');
+  far.classList.remove('hide');
+  vDec = new VideoDecoder({
+    output: pic => {
+      far.width = pic.displayWidth; far.height = pic.displayHeight;
+      paint.drawImage(pic, 0, 0);
+      pic.close();
+    },
+    error: e => say('picture: ' + e.message)
+  });
+  vDec.configure({ codec: 'avc1.42001f', optimizeForLatency: true });
+  vDec.ready = false;
+}
+
+async function camera(on) {
+  // Whatever goes wrong here should be said out loud, not swallowed.
+  try {
+    await cameraDo(on);
+  } catch (e) {
+    say('camera: ' + e.message);
+    camOn = false;
+  }
+  $('cam').textContent = camOn ? 'Camera off' : 'Camera';
+  $('cam').classList.toggle('off', !camOn);
+}
+
+async function cameraDo(on) {
+  camOn = on;
+  $('cam').classList.toggle('off', !on);
+  if (!on) {
+    if (vTimer) { clearInterval(vTimer); vTimer = null; }
+    $('self').classList.add('hide');
+    $('self').srcObject = null;
+    if (vTrack) { vTrack.stop(); vTrack = null; }
+    if (vEnc && vEnc.state === 'configured') { vEnc.close(); vEnc = null; }
+    return;
+  }
+  if (!window.VideoEncoder) { say('this browser cannot encode video'); camOn = false; return; }
+  let cam;
+  try {
+    cam = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360, frameRate: 15 } });
+  } catch (e) { say('no camera: ' + e.message); camOn = false; return; }
+  vTrack = cam.getVideoTracks()[0];
+  vEnc = new VideoEncoder({
+    output: chunk => {
+      const bytes = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(bytes);
+      vFrame++;
+      const count = Math.ceil(bytes.length / CHUNK_MAX);
+      for (let i = 0; i < count; i++) {
+        const piece = bytes.slice(i * CHUNK_MAX, (i + 1) * CHUNK_MAX);
+        const p = head(VIDEO, room, me, 4 + 2 + 2 + piece.length);
+        const v = new DataView(p.buffer);
+        v.setUint32(HEAD, vFrame, true);
+        v.setUint16(HEAD + 4, i, true);
+        v.setUint16(HEAD + 6, count, true);
+        p.set(piece, VIDEO_HEAD);
+        if (ws && ws.readyState === 1) { ws.send(p); sent += p.length; }
+      }
+    },
+    error: e => say('camera: ' + e.message)
+  });
+  vEnc.configure({
+    codec: 'avc1.42001f', width: 480, height: 360, bitrate: 400000, framerate: 15,
+    latencyMode: 'realtime', avc: { format: 'annexb' }
+  });
+  // The gate again: a frame that looks like the one before is dropped
+  // before it is encoded, so a still scene sends nothing.
+  //
+  // The picture comes through a video element and a canvas rather than
+  // a track reader, because that is the way every browser has.
+  const shown = $('self');
+  shown.srcObject = cam;
+  shown.classList.remove('hide');
+  shown.play().catch(() => {});
+  const big = document.createElement('canvas');
+  big.width = 480; big.height = 360;
+  const paintBig = big.getContext('2d');
+  const small = document.createElement('canvas');
+  small.width = 32; small.height = 24;
+  const paintSmall = small.getContext('2d', { willReadFrequently: true });
+  let since = 0, stamp = 0;
+  lastSmall = null;
+
+  vTimer = setInterval(() => {
+    if (!camOn || !vEnc || vEnc.state !== 'configured' || shown.readyState < 2) return;
+    paintBig.drawImage(shown, 0, 0, 480, 360);
+    paintSmall.drawImage(big, 0, 0, 32, 24);
+    const now = paintSmall.getImageData(0, 0, 32, 24).data;
+    let moved = 0;
+    if (lastSmall) {
+      for (let i = 0; i < now.length; i += 4) moved += Math.abs(now[i] - lastSmall[i]);
+    }
+    const first = !lastSmall;
+    lastSmall = now;
+    since++;
+    const key = first || since > 60;
+    if (!first && moved < 700 && !key) return;
+    const frame = new VideoFrame(big, { timestamp: stamp });
+    stamp += 1e6 / 15;
+    vEnc.encode(frame, { keyFrame: key });
+    frame.close();
+    if (key) since = 0;
+  }, 1000 / 15);
+}
+
+function stop() {
+  try { ws && ws.send(head(LEAVE, room, me, 0)); } catch (e) {}
+  clearInterval(beat);
+  camera(false);
+  if (ws) ws.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  began = 0;
+  $('call').classList.add('hide');
+  $('setup').classList.remove('hide');
+}
+
+$('join').onclick = start;
+$('leave').onclick = stop;
+$('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', !muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
+$('cam').onclick = () => camera(!camOn);
+window.addEventListener('beforeunload', () => { try { ws && ws.send(head(LEAVE, room, me, 0)); } catch (e) {} });
+</script>
+</body>
+</html>
