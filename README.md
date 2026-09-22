@@ -12,7 +12,10 @@ On an ordinary conversation each end talks less than half the time, and says not
 
 ## Using it
 
+Started with no room, it shows the rooms you have been in and asks which one. That is how a launcher starts it.
+
 ```bash
+hush                      # pick a room from the ones you have used
 hush kitchen              # join the room called kitchen
 hush kitchen -n Geir      # under a name the others will see
 hush kitchen -s host:port # through a particular relay

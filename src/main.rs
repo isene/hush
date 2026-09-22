@@ -174,9 +174,19 @@ fn main() {
     }
 
     if room.is_empty() {
-        help();
-        std::process::exit(1);
+        // No room named, which is how a launcher starts it. Ask on a
+        // screen rather than print a page of help and vanish.
+        match start_screen(&server, &mut name) {
+            Some((picked, picked_camera)) => {
+                room = picked;
+                if camera.is_none() {
+                    camera = picked_camera;
+                }
+            }
+            None => return,
+        }
     }
+    remember_room(&room);
     if server.is_empty() {
         eprintln!("hush: no relay to go through.");
         eprintln!("Put one line in ~/.hush, `host:port`, or pass -s host:port.");
@@ -196,6 +206,159 @@ fn main() {
         eprintln!("hush: {e}");
         std::process::exit(1);
     }
+}
+
+/// The rooms joined before, newest first, at most eight.
+fn recent_rooms() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::fs::read_to_string(std::path::Path::new(&home).join(".hush-rooms"))
+        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).take(8).collect())
+        .unwrap_or_default()
+}
+
+/// Put this room at the top of that list.
+fn remember_room(room: &str) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut rooms = recent_rooms();
+    rooms.retain(|r| r != room);
+    rooms.insert(0, room.to_string());
+    rooms.truncate(8);
+    let _ = std::fs::write(std::path::Path::new(&home).join(".hush-rooms"), rooms.join("\n") + "\n");
+}
+
+/// A camera to offer: the first one this machine has, or the made-up
+/// picture when it has none.
+fn a_camera() -> String {
+    for n in 0..8 {
+        let dev = format!("/dev/video{n}");
+        if std::path::Path::new(&dev).exists() {
+            return dev;
+        }
+    }
+    "test".to_string()
+}
+
+/// The screen hush shows when it is started with no room named: the
+/// rooms you have been in, your name, and whether the camera goes on.
+fn start_screen(server: &str, name: &mut String) -> Option<(String, Option<String>)> {
+    Crust::init();
+    Crust::set_app_identity("Hush");
+    let mut rooms = recent_rooms();
+    if rooms.is_empty() {
+        rooms.push("kitchen".to_string());
+    }
+    let mut pick = 0usize;
+    let mut camera = false;
+    let device = a_camera();
+    // Drawn once, and again only after a key. A screen waiting for an
+    // answer should cost nothing while it waits.
+    let mut draw = true;
+    loop {
+        let (cols, rows) = Crust::terminal_size();
+        let wide = cols.min(60).max(28);
+        let left = (cols.saturating_sub(wide)) / 2 + 1;
+        let top = (rows.saturating_sub(rooms.len() as u16 + 10)) / 2 + 1;
+        let after = top + 5 + rooms.len() as u16;
+        if draw {
+            draw = false;
+            print!("{}{}", seq::ERASE_ALL, seq::HOME);
+            print!(
+                "{}{}   {}",
+                move_to(top, left),
+                style::rgb("hush", Some(RUST_RGB), None, "b"),
+                style::dim("a call that sends nothing while you are quiet")
+            );
+            print!(
+                "{}{}",
+                move_to(top + 1, left),
+                style::rgb(
+                    &if server.is_empty() {
+                        "no relay yet: put one line of host:port in ~/.hush".to_string()
+                    } else {
+                        format!("through {server}")
+                    },
+                    Some(DIM_RGB),
+                    None,
+                    ""
+                )
+            );
+            print!("{}{}", move_to(top + 3, left), style::bold("Which room?"));
+            for (i, r) in rooms.iter().enumerate() {
+                let line = if i == pick {
+                    style::rgb(&format!("  {r}  "), Some(LIVE_RGB), Some(BAR_BG), "b")
+                } else {
+                    format!("  {}", style::dim(r))
+                };
+                print!("{}{}{}", move_to(top + 4 + i as u16, left), line, seq::ERASE_EOL);
+            }
+            print!(
+                "{}{}  {}{}",
+                move_to(after, left),
+                style::dim("you are"),
+                style::bold(name),
+                seq::ERASE_EOL
+            );
+            print!(
+                "{}{}  {}{}",
+                move_to(after + 1, left),
+                style::dim("camera "),
+                if camera {
+                    style::rgb(&format!("on, {device}"), Some(LIVE_RGB), None, "b")
+                } else {
+                    style::rgb("off", Some(IDLE_RGB), None, "")
+                },
+                seq::ERASE_EOL
+            );
+            print!(
+                "{}{}",
+                move_to(after + 3, left),
+                style::dim("enter joins · n new room · c camera · r rename · q quits")
+            );
+            std::io::stdout().flush().ok();
+        }
+
+        let Some(key) = Input::getchr_ms(60_000) else {
+            continue;
+        };
+        draw = true;
+        match key.as_str() {
+            "j" | "DOWN" => pick = (pick + 1) % rooms.len(),
+            "k" | "UP" => pick = (pick + rooms.len() - 1) % rooms.len(),
+            "c" => camera = !camera,
+            "n" => {
+                if let Some(new) = ask_line(left, after + 3, wide, "New room: ") {
+                    if !new.is_empty() {
+                        rooms.insert(0, new);
+                        pick = 0;
+                    }
+                }
+            }
+            "r" => {
+                if let Some(new) = ask_line(left, after + 3, wide, "Your name: ") {
+                    if !new.is_empty() {
+                        *name = new;
+                    }
+                }
+            }
+            "ENTER" => {
+                Crust::cleanup();
+                let with_camera = if camera { Some(device) } else { None };
+                return Some((rooms[pick].clone(), with_camera));
+            }
+            "q" | "ESC" => {
+                Crust::cleanup();
+                return None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One line typed in, or nothing when it was given up on.
+fn ask_line(x: u16, y: u16, wide: u16, prompt: &str) -> Option<String> {
+    let mut pane = Pane::new(x, y, wide, 1, 250, 236);
+    pane.scroll = false;
+    pane.ask_or_cancel(prompt, "").map(|t| t.trim().to_string())
 }
 
 /// The relay named in `~/.hush`, one line of `host:port`, or nothing.
