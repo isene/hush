@@ -37,6 +37,10 @@ The relay is a binary of its own. It needs nothing but Rust, and never touches t
 cargo build --release --no-default-features --bin hush-relay
 ```
 
+Check out [crust](https://github.com/isene/crust) beside this repo first.
+The caller needs it, and Cargo wants the folder there even when the
+relay is built without it.
+
 Put its address in `~/.hush`, one line:
 
 ```
