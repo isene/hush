@@ -72,6 +72,10 @@ fn main() {
     let mut name = std::env::var("USER").unwrap_or_else(|_| "someone".into());
     let mut mic = String::from("default");
     let mut out = String::from("default");
+    // The echo canceller is on unless a device is named by hand, since
+    // naming one says which microphone to use, and the canceller's is
+    // a different one.
+    let mut want_aec = true;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -91,12 +95,15 @@ fn main() {
             }
             "--mic" => {
                 mic = args.get(i + 1).cloned().unwrap_or(mic);
+                want_aec = false;
                 i += 1;
             }
             "--out" => {
                 out = args.get(i + 1).cloned().unwrap_or(out);
+                want_aec = false;
                 i += 1;
             }
+            "--no-aec" => want_aec = false,
             "-v" | "--version" => {
                 println!("hush {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -129,7 +136,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    if let Err(e) = call(&server, &room, &name, &mic, &out) {
+    // Loaded here and dropped when the call ends, so nothing of it runs
+    // between calls.
+    let aec = if want_aec { audio::Aec::start() } else { None };
+    if aec.is_some() {
+        mic = audio::AEC_MIC.to_string();
+        out = audio::AEC_OUT.to_string();
+    }
+
+    if let Err(e) = call(&server, &room, &name, &mic, &out, aec.is_some()) {
         eprintln!("hush: {e}");
         std::process::exit(1);
     }
@@ -160,12 +175,14 @@ fn help() {
     println!("  -s HOST:PORT  the relay to go through (default: the line in ~/.hush)");
     println!("  --mic DEVICE  an ALSA device other than the default");
     println!("  --out DEVICE  likewise for the speaker");
+    println!("  --no-aec      leave the echo canceller out");
     println!("  --relay PORT  be the relay instead of joining a call");
     println!();
-    println!("Wear headphones. Without them the far end hears itself.");
+    println!("PipeWire's echo canceller is used when it is there, so the far end");
+    println!("does not hear itself. Headphones are still the safer answer.");
 }
 
-fn call(server: &str, room: &str, name: &str, mic: &str, out: &str) -> std::io::Result<()> {
+fn call(server: &str, room: &str, name: &str, mic: &str, out: &str, aec: bool) -> std::io::Result<()> {
     let addr = server
         .to_socket_addrs()?
         .next()
@@ -199,7 +216,7 @@ fn call(server: &str, room: &str, name: &str, mic: &str, out: &str) -> std::io::
     let talk = std::thread::spawn({
         let (sock, state, tally, going) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone());
         let (room, name, mic) = (room.to_string(), name.to_string(), mic.to_string());
-        move || speak(sock, &room, &name, &mic, state, tally, going)
+        move || speak(sock, &room, &name, &mic, aec, state, tally, going)
     });
     let listen = std::thread::spawn({
         let (sock, state, tally, going, waiting) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone(), waiting.clone());
@@ -207,7 +224,7 @@ fn call(server: &str, room: &str, name: &str, mic: &str, out: &str) -> std::io::
     });
     let play = std::thread::spawn({
         let (going, waiting, out) = (going.clone(), waiting.clone(), out.to_string());
-        move || play_back(&out, waiting, going)
+        move || play_back(&out, aec, waiting, going)
     });
     let beat = std::thread::spawn({
         let (sock, going) = (sock.try_clone()?, going.clone());
@@ -222,7 +239,7 @@ fn call(server: &str, room: &str, name: &str, mic: &str, out: &str) -> std::io::
         }
     });
 
-    screen(room, name, server, &state, &tally, &going);
+    screen(room, name, server, aec, &state, &tally, &going);
 
     going.store(false, Ordering::Relaxed);
     let _ = sock.send(&net::leave(room, name));
@@ -239,11 +256,12 @@ fn speak(
     room: &str,
     name: &str,
     mic: &str,
+    aec: bool,
     state: Arc<Mutex<State>>,
     tally: Arc<Tally>,
     going: Arc<AtomicBool>,
 ) {
-    let mut child = match audio::microphone(mic) {
+    let mut child = match audio::microphone(mic, aec) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -356,8 +374,8 @@ fn hear(
 
 /// Feed the speaker, twenty milliseconds at a time, silence when there
 /// is nothing waiting.
-fn play_back(out: &str, waiting: Arc<Mutex<Vec<Vec<i16>>>>, going: Arc<AtomicBool>) {
-    let mut child = match audio::speaker(out) {
+fn play_back(out: &str, aec: bool, waiting: Arc<Mutex<Vec<Vec<i16>>>>, going: Arc<AtomicBool>) {
+    let mut child = match audio::speaker(out, aec) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -446,6 +464,7 @@ fn screen(
     room: &str,
     name: &str,
     server: &str,
+    aec: bool,
     state: &Arc<Mutex<State>>,
     tally: &Arc<Tally>,
     going: &Arc<AtomicBool>,
@@ -573,9 +592,10 @@ fn screen(
             );
         }
         status.say(&format!(
-            " {}  {}  {}",
+            " {}  {}  {}  {}",
             style::rgb("m", Some(HEAD_RGB), None, "b"),
             style::dim("mute · q hangs up"),
+            style::dim(if aec { "echo cancelled" } else { "no echo cancelling · wear headphones" }),
             style::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
         ));
         std::io::stdout().flush().ok();

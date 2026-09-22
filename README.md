@@ -14,6 +14,7 @@ On an ordinary conversation each end talks less than half the time, and says not
 hush kitchen              # join the room called kitchen
 hush kitchen -n Geir      # under a name the others will see
 hush kitchen -s host:port # through a particular relay
+hush kitchen --no-aec     # without the echo canceller
 ```
 
 | Key | Does |
@@ -21,7 +22,18 @@ hush kitchen -s host:port # through a particular relay
 | `m` | Mute, and unmute |
 | `q` | Hang up |
 
-**Wear headphones.** There is no echo cancellation, so without them the far end hears itself.
+## The echo
+
+Your speaker plays the far end's voice, your microphone hears it, and a call with no answer to that sends it straight back. The far end then hears itself, half a second late.
+
+PipeWire ships the canceller that browsers use, and hush borrows it for the length of a call.
+
+- It is loaded when the call starts and unloaded when the call ends, so nothing of it runs in between.
+- A call left behind by a killed hush is cleared away by the next one.
+- `--no-aec` leaves it out, and so does naming a device with `--mic` or `--out`.
+- Without PipeWire hush falls back to `arecord` and `aplay`, and then you want headphones.
+
+Headphones are still the safer answer on a laptop with loud speakers.
 
 ## The relay
 

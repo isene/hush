@@ -93,28 +93,112 @@ impl Default for Gate {
     }
 }
 
-/// The microphone, as a stream of raw samples.
-pub fn microphone(device: &str) -> std::io::Result<Child> {
-    Command::new("arecord")
-        .args(["-q", "-D", device, "-f", "S16_LE", "-r"])
-        .arg(RATE.to_string())
-        .args(["-c", "1", "-t", "raw", "-"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+/// The echo canceller, borrowed from PipeWire for the length of a call.
+///
+/// Your speaker plays the far end's voice, your microphone hears it, and
+/// without this you send it straight back. PipeWire ships the canceller
+/// browsers use. Loading it makes a cleaned microphone and a speaker to
+/// go with it, and they only work as a pair: the canceller can subtract
+/// nothing but the sound it played itself.
+///
+/// It is loaded when the call starts and unloaded when the call ends, so
+/// nothing of it runs in between.
+pub struct Aec {
+    module: String,
 }
 
-/// The speaker, as somewhere to write raw samples.
-pub fn speaker(device: &str) -> std::io::Result<Child> {
-    Command::new("aplay")
-        .args(["-q", "-D", device, "-f", "S16_LE", "-r"])
-        .arg(RATE.to_string())
-        // A small buffer, because a call is worth more latency-free than
-        // it is worth gap-free.
-        .args(["-c", "1", "-t", "raw", "--buffer-size=4800", "-"])
-        .stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+/// What the canceller's two ends are called once it is loaded.
+pub const AEC_MIC: &str = "hush_mic";
+pub const AEC_OUT: &str = "hush_out";
+
+impl Aec {
+    /// Load it, or give back nothing on a machine without PipeWire.
+    pub fn start() -> Option<Aec> {
+        clear_old();
+        let out = Command::new("pactl")
+            .args([
+                "load-module",
+                "module-echo-cancel",
+                &format!("source_name={AEC_MIC}"),
+                &format!("sink_name={AEC_OUT}"),
+                "aec_method=webrtc",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let module = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if module.is_empty() {
+            None
+        } else {
+            Some(Aec { module })
+        }
+    }
+}
+
+impl Drop for Aec {
+    fn drop(&mut self) {
+        let _ = Command::new("pactl").args(["unload-module", &self.module]).status();
+    }
+}
+
+/// A canceller left over from a call that was killed rather than ended.
+/// Loading a second one would take the name and leave both behind, so
+/// the old one goes first.
+fn clear_old() {
+    let Ok(out) = Command::new("pactl").args(["list", "short", "modules"]).output() else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.contains(AEC_MIC) {
+            continue;
+        }
+        if let Some(id) = line.split_whitespace().next() {
+            let _ = Command::new("pactl").args(["unload-module", id]).status();
+        }
+    }
+}
+
+/// The microphone, as a stream of raw samples. `pipewire` says the name
+/// is a PipeWire node rather than an ALSA device, which is how the
+/// canceller's cleaned microphone is reached.
+pub fn microphone(device: &str, pipewire: bool) -> std::io::Result<Child> {
+    let mut cmd = if pipewire {
+        let mut c = Command::new("pw-record");
+        c.args(["--target", device, "--channels", "1", "--format", "s16", "--raw"])
+            .args(["--latency", "40ms", "--rate"])
+            .arg(RATE.to_string())
+            .arg("-");
+        c
+    } else {
+        let mut c = Command::new("arecord");
+        c.args(["-q", "-D", device, "-f", "S16_LE", "-r"])
+            .arg(RATE.to_string())
+            .args(["-c", "1", "-t", "raw", "-"]);
+        c
+    };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+}
+
+/// The speaker, as somewhere to write raw samples. A small buffer, since
+/// a call is worth more latency-free than it is worth gap-free.
+pub fn speaker(device: &str, pipewire: bool) -> std::io::Result<Child> {
+    let mut cmd = if pipewire {
+        let mut c = Command::new("pw-play");
+        c.args(["--target", device, "--channels", "1", "--format", "s16", "--raw"])
+            .args(["--latency", "100ms", "--rate"])
+            .arg(RATE.to_string())
+            .arg("-");
+        c
+    } else {
+        let mut c = Command::new("aplay");
+        c.args(["-q", "-D", device, "-f", "S16_LE", "-r"])
+            .arg(RATE.to_string())
+            .args(["-c", "1", "-t", "raw", "--buffer-size=4800", "-"]);
+        c
+    };
+    cmd.stdin(Stdio::piped()).stderr(Stdio::null()).spawn()
 }
 
 /// Samples as bytes, and back, in the order ALSA wants them.
