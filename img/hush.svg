@@ -24,4 +24,7 @@
     <rect x="139" y="106" width="13" height="44"  rx="6.5"/>
   </g>
   <rect x="160" y="124" width="62" height="8" rx="4" fill="#f74c00" opacity="0.45"/>
+
+  <circle cx="128" cy="128" r="124" fill="none" stroke="#f74c00" stroke-width="3" stroke-opacity=".9"/>
+  <circle cx="128" cy="128" r="118" fill="none" stroke="#ffb066" stroke-width="1" stroke-opacity=".5"/>
 </svg>
