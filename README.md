@@ -1,5 +1,7 @@
 # hush
 
+<img src="img/hush.svg" align="right" width="150">
+
 **A voice call that sends nothing while you are quiet.**
 
 ![Rust](https://img.shields.io/badge/language-Rust-orange) ![Unlicense](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
