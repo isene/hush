@@ -8,8 +8,27 @@ repository = "https://github.com/isene/hush"
 authors = ["Geir Isene <g@isene.com>"]
 
 [dependencies]
-audiopus = "0.2"
-crust = { version = "0.1", path = "../crust", package = "fe2o3-crust" }
+audiopus = { version = "0.2", optional = true }
+crust = { version = "0.1", path = "../crust", package = "fe2o3-crust", optional = true }
+
+[features]
+# The caller needs Opus and a terminal library. The relay needs neither,
+# so a server can build it with nothing else installed.
+default = ["caller"]
+caller = ["dep:audiopus", "dep:crust"]
+
+[[bin]]
+name = "hush"
+path = "src/main.rs"
+required-features = ["caller"]
+
+[[bin]]
+name = "hush-relay"
+path = "src/bin/hush-relay.rs"
+
+[lib]
+name = "hush"
+path = "src/lib.rs"
 
 [profile.release]
 opt-level = 3

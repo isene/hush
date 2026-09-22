@@ -14,7 +14,8 @@
 //! to a relay with a real address. Run one with `hush --relay`.
 
 mod audio;
-mod net;
+
+use hush::net;
 
 use audio::{Gate, FRAME, RATE};
 use audiopus::coder::{Decoder, Encoder};

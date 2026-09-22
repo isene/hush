@@ -28,7 +28,13 @@ hush kitchen -s host:port # through a particular relay
 Two people at home are each behind a router that will not accept a call from outside. So neither dials the other. Both send to a relay on a machine with a real address, and the relay passes the packets on.
 
 ```bash
-hush --relay 7777         # on a machine both ends can reach
+hush-relay 7777           # on a machine both ends can reach
+```
+
+The relay is a binary of its own. It needs nothing but Rust, and never touches the sound libraries.
+
+```bash
+cargo build --release --no-default-features --bin hush-relay
 ```
 
 Put its address in `~/.hush`, one line:
@@ -63,7 +69,7 @@ sudo apt install libopus-dev
 cargo install --path .
 ```
 
-`arecord` and `aplay` do the sound, so there is no audio library to build against.
+`arecord` and `aplay` do the sound, so there is no audio library to build against beyond Opus itself.
 
 ## Files
 
