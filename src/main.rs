@@ -44,33 +44,49 @@ const IDLE_RGB: (u8, u8, u8) = (110, 110, 125);
 const BAR_BG: (u8, u8, u8) = (38, 38, 38);
 const DIM_RGB: (u8, u8, u8) = (140, 140, 150);
 
-/// The far end's last picture, as plain pixels, and whether the screen
-/// has drawn it yet.
+/// The far end's last picture, as plain pixels with their size, and
+/// whether the screen has drawn it yet.
 struct Seen {
     pixels: Vec<u8>,
+    w: usize,
+    h: usize,
     fresh: bool,
 }
 
-/// Everything the picture needs, in one place: where our own comes from,
-/// how big the far end's is drawn, the last one that arrived, and the
-/// camera itself while it runs.
+/// Everything the picture needs, in one place: where our own comes
+/// from, the last one that arrived, and the camera or the screen grab
+/// while one runs.
 struct Vid {
     /// A device path, the word `test`, or nothing when no camera was asked for.
     source: Option<String>,
-    /// The size the far end's picture is drawn at, in pixels and in cells.
-    px: (usize, usize),
-    cells: (u16, u16),
     seen: Mutex<Seen>,
     cam: Mutex<Option<Child>>,
+    /// Is it the screen that goes out, and not the camera?
+    sharing: AtomicBool,
 }
 
 impl Vid {
-    /// Is our own camera running right now?
+    /// Is a picture of ours going out right now, camera or screen?
     fn on(&self) -> bool {
         self.cam.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
-    /// Stop the camera. The thread sending pictures ends with it.
+    /// Is it the screen that is going out?
+    fn shares(&self) -> bool {
+        self.on() && self.sharing.load(Ordering::Relaxed)
+    }
+
+    /// What is going out right now, by the name it is asked for with:
+    /// `screen`, or the camera's own name. Nothing when nothing is.
+    fn going_out(&self) -> Option<String> {
+        match (self.on(), self.shares()) {
+            (false, _) => None,
+            (true, true) => Some("screen".to_string()),
+            (true, false) => self.source.clone(),
+        }
+    }
+
+    /// Stop the camera or the screen. The thread sending pictures ends with it.
     fn stop(&self) {
         if let Some(mut c) = self.cam.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = c.kill();
@@ -398,6 +414,9 @@ fn help() {
     println!("                `--video test` sends a test picture and needs no camera");
     println!("  --relay PORT  be the relay instead of joining a call");
     println!();
+    println!("In a call: m mutes, v is the camera, s shares the screen, z shows");
+    println!("the far end's picture big, q hangs up.");
+    println!();
     println!("PipeWire's echo canceller is used when it is there, so the far end");
     println!("does not hear itself. Headphones are still the safer answer.");
 }
@@ -442,21 +461,14 @@ fn call(
     });
     let going = Arc::new(AtomicBool::new(true));
 
-    // How big the far end's picture is drawn. Whole cells, and close to
-    // the shape a camera gives, so a face is not stretched.
-    let (cell_w, cell_h) = glow::get_cell_size();
-    let cols = 40u16;
-    let rows = (((cols as usize * cell_w as usize) * 3 / 4) as u16 / cell_h.max(1)).max(4);
-    let px = glow::cell_box(cols, rows);
     let vid = Arc::new(Vid {
         source: camera,
-        px,
-        cells: (cols, rows),
-        seen: Mutex::new(Seen { pixels: Vec::new(), fresh: false }),
+        seen: Mutex::new(Seen { pixels: Vec::new(), w: 0, h: 0, fresh: false }),
         cam: Mutex::new(None),
+        sharing: AtomicBool::new(false),
     });
-    // Pressing v asks for the camera back after it has been stopped.
-    let (ask, asked) = mpsc::channel::<()>();
+    // A key asks for a picture to go out: the camera's name, or `screen`.
+    let (ask, asked) = mpsc::channel::<String>();
 
     // The sound coming back, one queue of frames waiting to be played.
     let waiting: Arc<Mutex<Vec<Vec<i16>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -468,8 +480,8 @@ fn call(
     });
     let listen = std::thread::spawn({
         let (sock, state, tally, going, waiting) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone(), waiting.clone());
-        let (vid, lock) = (vid.clone(), lock.clone());
-        move || hear(sock, &lock, state, tally, going, waiting, vid)
+        let (vid, lock, ask) = (vid.clone(), lock.clone(), ask.clone());
+        move || hear(sock, &lock, state, tally, going, waiting, vid, ask)
     });
     let play = std::thread::spawn({
         let (going, waiting, out) = (going.clone(), waiting.clone(), out.to_string());
@@ -583,6 +595,7 @@ fn hear(
     going: Arc<AtomicBool>,
     waiting: Arc<Mutex<Vec<Vec<i16>>>>,
     vid: Arc<Vid>,
+    ask: mpsc::Sender<String>,
 ) {
     let mut dec = match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
         Ok(d) => d,
@@ -595,6 +608,8 @@ fn hear(
     // Nothing of the picture side exists until a picture actually comes.
     let mut joining = video::Joining::new();
     let mut into_decoder: Option<std::process::ChildStdin> = None;
+    // Which run of pictures is being decoded: one camera or one screen.
+    let mut showing: Option<u8> = None;
     while going.load(Ordering::Relaxed) {
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
@@ -628,14 +643,24 @@ fn hear(
                     q.push(frame);
                 }
             }
-            net::In::Picture { frame, index, count, chunk, .. } => {
+            net::In::Picture { run, frame, index, count, chunk, .. } => {
                 tally.recv_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                if into_decoder.is_none() {
-                    into_decoder = start_decoder(&vid, &going);
+                if showing != Some(run) {
+                    // The far end started a camera or a screen. Its
+                    // pictures begin again, maybe at another size, so
+                    // the decoder begins again too.
+                    showing = Some(run);
+                    into_decoder = None;
+                    joining = video::Joining::new();
                 }
                 if let Some(whole) = joining.take(frame, index, count, chunk) {
+                    // A decoder can only begin with a keyframe, so it
+                    // is not started for anything less.
+                    if into_decoder.is_none() && video::is_key(&whole) {
+                        into_decoder = start_decoder(&vid, &going);
+                    }
                     if let Some(sink) = into_decoder.as_mut() {
-                        if sink.write_all(&whole).is_err() {
+                        if sink.write_all(&video::for_decoder(&whole)).is_err() {
                             into_decoder = None;
                         }
                     }
@@ -643,7 +668,16 @@ fn hear(
             }
             net::In::Who(names) => {
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                let someone_new = !s.here.is_empty() && names.iter().any(|n| !s.here.contains(n));
                 s.here = names;
+                drop(s);
+                // Someone new can only start from a keyframe, and a
+                // still screen sends none. So the picture going out
+                // begins again, which starts with one.
+                if let (true, Some(source)) = (someone_new, vid.going_out()) {
+                    vid.stop();
+                    let _ = ask.send(source);
+                }
             }
             net::In::Line { .. } | net::In::Other => {}
         }
@@ -654,21 +688,17 @@ fn hear(
 /// they come out. Called on the first picture and not before, so a call
 /// without video never starts any of this.
 fn start_decoder(vid: &Arc<Vid>, going: &Arc<AtomicBool>) -> Option<std::process::ChildStdin> {
-    let mut child = video::decoder(vid.px.0, vid.px.1).ok()?;
+    let mut child = video::decoder().ok()?;
     let sink = child.stdin.take()?;
-    let mut src = child.stdout.take()?;
+    let mut src = std::io::BufReader::with_capacity(1 << 16, child.stdout.take()?);
     let (vid, going) = (vid.clone(), going.clone());
     std::thread::spawn(move || {
-        let each = vid.px.0 * vid.px.1 * 3;
-        let mut frame = vec![0u8; each];
         while going.load(Ordering::Relaxed) {
-            if src.read_exact(&mut frame).is_err() {
+            let Some((w, h, pixels)) = video::read_picture(&mut src) else {
                 break;
-            }
+            };
             let mut seen = vid.seen.lock().unwrap_or_else(|e| e.into_inner());
-            seen.pixels.clear();
-            seen.pixels.extend_from_slice(&frame);
-            seen.fresh = true;
+            *seen = Seen { pixels, w, h, fresh: true };
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -676,8 +706,8 @@ fn start_decoder(vid: &Arc<Vid>, going: &Arc<AtomicBool>) -> Option<std::process
     Some(sink)
 }
 
-/// Send our own pictures while the camera runs, and wait to be asked
-/// again once it has been stopped.
+/// Send our own pictures while the camera or the screen runs, and wait
+/// to be asked again once it has been stopped.
 fn watch(
     sock: UdpSocket,
     lock: &secret::Lock,
@@ -686,30 +716,41 @@ fn watch(
     vid: Arc<Vid>,
     tally: Arc<Tally>,
     going: Arc<AtomicBool>,
-    asked: mpsc::Receiver<()>,
+    asked: mpsc::Receiver<String>,
 ) {
-    let Some(source) = vid.source.clone() else {
-        return;
-    };
-    let mut run = true;
+    // A camera named on the command line starts with the call.
+    let mut next = vid.source.clone();
+    // Each start gets a number of its own, so the far end can tell a
+    // new run of pictures from the last. It begins anywhere, so a call
+    // joined twice does not begin at the same number twice.
+    let mut run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() as u8)
+        .unwrap_or(0);
     while going.load(Ordering::Relaxed) {
-        if run {
-            send_pictures(&sock, lock, room, name, &source, &vid, &tally, &going);
+        if let Some(source) = next.take() {
+            run = run.wrapping_add(1);
+            send_pictures(&sock, lock, room, name, &source, run, &vid, &tally, &going);
         }
-        // Nothing wakes this up but a key asking for the camera back.
-        run = asked.recv().is_ok();
+        // Nothing wakes this up but a key asking for a picture. When
+        // more than one has asked, the last one is the one meant.
+        match asked.recv() {
+            Ok(source) => next = Some(asked.try_iter().last().unwrap_or(source)),
+            Err(_) => break,
+        }
     }
 }
 
-/// One camera, from start to stop: each picture in as many pieces as it
-/// takes. Pictures that look like the one before never get here, since
-/// the camera throws them away before encoding them.
+/// One camera or one screen, from start to stop: each picture in as
+/// many pieces as it takes. Pictures that look like the one before
+/// never get here, since they are thrown away before encoding.
 fn send_pictures(
     sock: &UdpSocket,
     lock: &secret::Lock,
     room: &str,
     name: &str,
     source: &str,
+    run: u8,
     vid: &Arc<Vid>,
     tally: &Arc<Tally>,
     going: &Arc<AtomicBool>,
@@ -720,6 +761,7 @@ fn send_pictures(
     let Some(out) = child.stdout.take() else {
         return;
     };
+    vid.sharing.store(source == "screen", Ordering::Relaxed);
     *vid.cam.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
     let mut pictures = video::Pictures::new(out);
     let mut id = 0u32;
@@ -730,7 +772,7 @@ fn send_pictures(
         id += 1;
         let count = frame.chunks(net::CHUNK_MAX).count() as u16;
         for (i, chunk) in frame.chunks(net::CHUNK_MAX).enumerate() {
-            let packet = lock.seal(&net::head(net::VIDEO, room, name), &net::picture(id, i as u16, count, chunk));
+            let packet = lock.seal(&net::head(net::VIDEO, room, name), &net::picture(run, id, i as u16, count, chunk));
             if sock.send(&packet).is_ok() {
                 tally.sent_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
             }
@@ -836,7 +878,7 @@ fn screen(
     tally: &Arc<Tally>,
     going: &Arc<AtomicBool>,
     vid: &Arc<Vid>,
-    ask: &mpsc::Sender<()>,
+    ask: &mpsc::Sender<String>,
 ) {
     Crust::init();
     Crust::set_app_identity("Hush");
@@ -851,6 +893,13 @@ fn screen(
     let mut shown: Option<u32> = None;
     let mut turn = 0u32;
     let mut drawn = false;
+    // The far end's picture: small beside the meters, or as big as the
+    // window takes (z). `boxed` is the box of cells it was last drawn in.
+    let cell = glow::get_cell_size();
+    let mut big = false;
+    let mut boxed = (0u16, 0u16);
+    // A screen can be shared where there is one to grab.
+    let can_share = std::env::var_os("DISPLAY").is_some();
     // The last row the pass before this one wrote on.
     let mut reached = 0u16;
 
@@ -889,26 +938,28 @@ fn screen(
             if pixels {
                 let mut seen = vid.seen.lock().unwrap_or_else(|e| e.into_inner());
                 if seen.fresh && !seen.pixels.is_empty() {
-                    if !drawn {
-                        // The meters move down to make room for the
-                        // picture: wipe the rows they stood on.
+                    // The rows under the picture: the meters, the
+                    // people, the counts, the bar at the bottom.
+                    let under = 9 + s.here.len() as u16;
+                    let most = (if big { cols.saturating_sub(4) } else { 40 }, rows.saturating_sub(under));
+                    let fits = video::fit(seen.w, seen.h, cell, most.0.max(8), most.1.max(4));
+                    if fits != boxed {
+                        // Another size of picture: the old one goes, and
+                        // the meters move, so the rows they stood on are wiped.
+                        if let Some(old) = shown.take() {
+                            print!("{}", glow::kitty_forget(old));
+                        }
                         for r in 3..=reached {
                             print!("{}{}", move_to(r, 1), seq::ERASE_EOL);
                         }
+                        boxed = fits;
                     }
                     let id = 90 + turn % 2;
                     turn += 1;
                     print!(
                         "{}{}",
                         move_to(3, 3),
-                        glow::kitty_frame_rgb(
-                            id,
-                            vid.px.0 as u32,
-                            vid.px.1 as u32,
-                            vid.cells.0,
-                            vid.cells.1,
-                            &seen.pixels
-                        )
+                        glow::kitty_frame_rgb(id, seen.w as u32, seen.h as u32, boxed.0, boxed.1, &seen.pixels)
                     );
                     if let Some(old) = shown.replace(id) {
                         print!("{}", glow::kitty_forget(old));
@@ -919,7 +970,7 @@ fn screen(
             }
 
             let w = (cols as usize).saturating_sub(34).clamp(10, 60);
-            let mut row = if drawn { 4 + vid.cells.1 } else { 3 };
+            let mut row = if drawn { 4 + boxed.1 } else { 3 };
             let mine = if s.muted {
                 style::rgb("muted", Some((230, 120, 110)), None, "b")
             } else if s.open {
@@ -927,12 +978,20 @@ fn screen(
             } else {
                 style::rgb("quiet", Some(IDLE_RGB), None, "")
             };
+            // Everyone in the room sees the screen, so it says so in red
+            // for as long as that lasts.
+            let shared = if vid.shares() {
+                format!("  {}", style::rgb("your screen is shared", Some((230, 120, 110)), None, "b"))
+            } else {
+                String::new()
+            };
             print!(
-                "{}  {:<14} {} {}{}",
+                "{}  {:<14} {} {}{}{}",
                 move_to(row, 1),
                 style::bold("you"),
                 meter(s.level, s.floor, s.open && !s.muted, w),
                 mine,
+                shared,
                 seq::ERASE_EOL
             );
             print!("{}{}", move_to(row + 1, 1), seq::ERASE_EOL);
@@ -1015,11 +1074,7 @@ fn screen(
             style::rgb("m", Some(HEAD_RGB), None, "b"),
             style::dim("mute · q hangs up"),
             style::dim(if aec { "echo cancelled" } else { "no echo cancelling · wear headphones" }),
-            style::dim(match (&vid.source, vid.on()) {
-                (None, _) => "no camera",
-                (Some(_), true) => "v stops the camera",
-                (Some(_), false) => "v starts the camera",
-            }),
+            style::dim(&picture_keys(vid.source.is_some(), vid.on(), vid.shares(), can_share, drawn, big)),
             style::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
         ));
         std::io::stdout().flush().ok();
@@ -1038,12 +1093,29 @@ fn screen(
                 }
                 "v" if vid.source.is_some() => {
                     // Stopping it kills the camera, so the light goes out
-                    // and nothing encodes. Starting it asks for a new one.
-                    if vid.on() {
-                        vid.stop();
-                    } else {
-                        let _ = ask.send(());
+                    // and nothing encodes. Starting it asks for a new one,
+                    // in place of the screen if that was going out.
+                    let camera = vid.on() && !vid.shares();
+                    vid.stop();
+                    if let (false, Some(source)) = (camera, &vid.source) {
+                        let _ = ask.send(source.clone());
                     }
+                }
+                "s" if can_share => {
+                    // The screen goes out in place of the camera, and
+                    // stops on the same key.
+                    let shared = vid.shares();
+                    vid.stop();
+                    if !shared {
+                        let _ = ask.send("screen".to_string());
+                    }
+                }
+                "z" => {
+                    // The far end's picture big or small. A screen
+                    // nobody touches sends nothing new, so the picture
+                    // already here is drawn again at the new size.
+                    big = !big;
+                    vid.seen.lock().unwrap_or_else(|e| e.into_inner()).fresh = true;
                 }
                 _ => {}
             }
@@ -1054,6 +1126,22 @@ fn screen(
         print!("{}", glow::kitty_forget(old));
     }
     Crust::cleanup();
+}
+
+/// The keys for pictures, as the bar at the bottom names them: only the
+/// ones that do something right now.
+fn picture_keys(camera: bool, on: bool, shares: bool, can_share: bool, drawn: bool, big: bool) -> String {
+    let mut keys = Vec::new();
+    if camera {
+        keys.push(if on && !shares { "v stops the camera" } else { "v starts the camera" });
+    }
+    if can_share {
+        keys.push(if shares { "s stops sharing the screen" } else { "s shares the screen" });
+    }
+    if drawn {
+        keys.push(if big { "z small picture" } else { "z big picture" });
+    }
+    keys.join(" · ")
 }
 
 fn fmt_time(secs: f64) -> String {
@@ -1087,6 +1175,17 @@ mod tests {
         let soft = meter(0.002, 0.001, true, 30).matches('█').count();
         let loud = meter(0.2, 0.001, true, 30).matches('█').count();
         assert!(loud > soft, "a shout lights more of the bar than a whisper");
+    }
+
+    #[test]
+    fn the_bar_names_only_the_picture_keys_that_do_something() {
+        assert_eq!(picture_keys(false, false, false, false, false, false), "");
+        assert_eq!(picture_keys(true, true, false, true, false, false), "v stops the camera · s shares the screen");
+        assert_eq!(
+            picture_keys(true, true, true, true, true, false),
+            "v starts the camera · s stops sharing the screen · z big picture"
+        );
+        assert_eq!(picture_keys(false, false, false, true, true, true), "s shares the screen · z small picture");
     }
 
     #[test]

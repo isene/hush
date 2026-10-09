@@ -12,9 +12,14 @@
 //! A picture does not fit in a packet, so each one goes out in pieces
 //! and is put back together at the far end. A piece that never arrives
 //! costs that one picture, and the next whole one replaces it.
+//!
+//! The screen goes the same way as the camera: the same encoder, the
+//! same gate, so a screen nobody touches sends nothing either.
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// What the camera sends, and how often.
 pub const WIDTH: u16 = 480;
@@ -24,67 +29,149 @@ pub const FPS: u16 = 15;
 /// The graphics chip that does the encoding, where there is one.
 const RENDER: &str = "/dev/dri/renderD128";
 
+/// How often the screen is looked at. Text needs no more, and every
+/// look that shows a change is a picture to encode and send.
+pub const SCREEN_FPS: u16 = 5;
+
 /// The camera, as a stream of encoded pictures. `source` is a device
-/// path, or the word `test` for a moving picture that needs no camera.
+/// path, the word `test` for a moving picture that needs no camera, or
+/// the word `screen` for the screen itself.
 pub fn camera(source: &str) -> std::io::Result<Child> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-loglevel", "error"]);
     let hardware = std::path::Path::new(RENDER).exists();
-    if hardware {
-        cmd.args(["-vaapi_device", RENDER]);
-    }
-    if source == "test" {
-        // A camera paces itself. A made-up picture does not, so it has to
-        // be told, or it floods the line as fast as the chip can encode.
-        cmd.args(["-re", "-f", "lavfi", "-i"])
-            .arg(format!("testsrc=size={WIDTH}x{HEIGHT}:rate={FPS}"));
-    } else {
-        cmd.args(["-f", "v4l2", "-framerate"])
-            .arg(FPS.to_string())
-            .args(["-i", source]);
-    }
-    // Scale to what we send, drop what has not changed, then hand the
-    // frame to the chip. The numbers are how different a frame has to
-    // be to count as a new one; these let a face move and hold a still
-    // room shut.
-    let gate = format!(
-        "scale={WIDTH}:{HEIGHT},mpdecimate=hi=768:lo=320:frac=0.2{}",
-        if hardware { ",format=nv12,hwupload" } else { "" }
-    );
-    cmd.args(["-vf", &gate]);
-    if hardware {
-        cmd.args(["-c:v", "h264_vaapi"]);
-    } else {
-        cmd.args(["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"]);
-    }
-    // The plainest H.264 there is. Browsers decode this one everywhere,
-    // and the terminal end is happy with it either way.
-    cmd.args(["-profile:v", "constrained_baseline", "-level", "31"]);
-    // No B-frames, so a picture is ready the moment it is encoded.
-    //
-    // A keyframe every four seconds, and one whenever somebody new can
-    // only start from one. It costs nothing while the picture stands
-    // still, because then no frame reaches the encoder at all and the
-    // clock it counts by never moves.
-    cmd.args(["-force_key_frames", "expr:gte(t,n_forced*4)"]);
-    cmd.args(["-b:v", "400k", "-g", "600", "-bf", "0", "-f", "h264", "-"])
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+    Command::new("ffmpeg")
+        .args(encoder_args(source, hardware, &display))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
 }
 
-/// The far end's pictures, decoded to plain pixels at the size they will
-/// be drawn, so nothing has to be scaled twice.
-pub fn decoder(w: usize, h: usize) -> std::io::Result<Child> {
+/// What ffmpeg is told, to turn a camera or the screen into H.264.
+/// `hardware` says whether the graphics chip does the encoding.
+fn encoder_args(source: &str, hardware: bool, display: &str) -> Vec<String> {
+    let screen = source == "screen";
+    let mut args: Vec<String> = Vec::new();
+    let mut add = |words: &[&str]| args.extend(words.iter().map(|w| w.to_string()));
+    add(&["-hide_banner", "-loglevel", "error"]);
+    if hardware {
+        add(&["-vaapi_device", RENDER]);
+    }
+    if screen {
+        add(&["-f", "x11grab", "-framerate", &SCREEN_FPS.to_string(), "-i", display]);
+    } else if source == "test" {
+        // A camera paces itself. A made-up picture does not, so it has to
+        // be told, or it floods the line as fast as the chip can encode.
+        add(&["-re", "-f", "lavfi", "-i", &format!("testsrc=size={WIDTH}x{HEIGHT}:rate={FPS}")]);
+    } else {
+        add(&["-f", "v4l2", "-framerate", &FPS.to_string(), "-i", source]);
+    }
+    // Drop what has not changed, scale to what we send, then hand the
+    // frame to the chip. The numbers are how different a frame has to
+    // be to count as a new one.
+    let gate = if screen {
+        // A screen has no noise in it, so any change at all is a real
+        // one: a typed letter, the pointer. It is looked for before the
+        // scaling, where a letter is still sharp. The picture keeps its
+        // shape and fills what it can of 1280 by 720: big enough to
+        // read text by, and no more than every decoder takes.
+        "mpdecimate=hi=128:lo=128:frac=1,\
+         scale=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            .to_string()
+    } else {
+        // These let a face move and keep a still room shut.
+        format!("scale={WIDTH}:{HEIGHT},mpdecimate=hi=768:lo=320:frac=0.2")
+    };
+    add(&["-vf", &format!("{gate}{}", if hardware { ",format=nv12,hwupload" } else { "" })]);
+    // The plainest H.264 there is. Browsers decode this one everywhere,
+    // and the terminal end is happy with it either way. libx264 calls
+    // it `baseline` and knows no other name for it.
+    if hardware {
+        // The chip gives a picture back when it gets the next one,
+        // unless told to work on one at a time.
+        add(&["-c:v", "h264_vaapi", "-async_depth", "1", "-profile:v", "constrained_baseline"]);
+    } else {
+        add(&["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "baseline"]);
+    }
+    add(&["-level", "31"]);
+    // Only the pictures that got through the gate are encoded. Left to
+    // itself ffmpeg fills every hole the gate made with an empty picture.
+    add(&["-fps_mode", "passthrough"]);
+    // No B-frames, so a picture is ready the moment it is encoded.
+    //
+    // A keyframe when four seconds have gone since the last one. It
+    // costs nothing while the picture stands still, because then no
+    // frame reaches the encoder at all.
+    add(&["-force_key_frames", "expr:if(isnan(prev_forced_t),gte(t,4),gte(t,prev_forced_t+4))"]);
+    add(&["-b:v", if screen { "600k" } else { "400k" }, "-g", "600", "-bf", "0"]);
+    // Each picture is written out the moment it is done.
+    add(&["-flush_packets", "1", "-f", "h264", "-"]);
+    args
+}
+
+/// The far end's pictures, decoded to plain pixels at the size they
+/// were sent. Each comes out with its size written in front of it, so a
+/// camera and a screen need nothing told about them beforehand, and the
+/// terminal does the one scaling there is.
+pub fn decoder() -> std::io::Result<Child> {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-flags", "low_delay"])
-        .args(["-f", "h264", "-i", "-", "-vf"])
-        .arg(format!("scale={w}:{h}"))
-        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        // Left to itself ffmpeg reads twenty pictures before it shows
+        // the first, to learn what it has been given. The first one
+        // says all of it, and a still screen sends no second.
+        .args(["-probesize", "2048", "-fpsprobesize", "0"])
+        .args(["-f", "h264", "-i", "-"])
+        .args(["-c:v", "ppm", "-f", "image2pipe", "-flush_packets", "1", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
+}
+
+/// One picture off the decoder: how wide, how high, and its pixels,
+/// three bytes each. Nothing once the decoder has stopped.
+///
+/// The decoder writes each picture as a PPM file: `P6`, the width and
+/// height, the brightest value, each followed by white space, then the
+/// pixels.
+pub fn read_picture(src: &mut impl BufRead) -> Option<(usize, usize, Vec<u8>)> {
+    let word = |src: &mut dyn BufRead| -> Option<String> {
+        let mut w = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            src.read_exact(&mut b).ok()?;
+            if b[0].is_ascii_whitespace() {
+                if !w.is_empty() {
+                    return String::from_utf8(w).ok();
+                }
+            } else {
+                w.push(b[0]);
+            }
+        }
+    };
+    if word(src)? != "P6" {
+        return None;
+    }
+    let (w, h): (usize, usize) = (word(src)?.parse().ok()?, word(src)?.parse().ok()?);
+    if word(src)? != "255" || w == 0 || h == 0 || w > 8192 || h > 8192 {
+        return None;
+    }
+    let mut pixels = vec![0u8; w * h * 3];
+    src.read_exact(&mut pixels).ok()?;
+    Some((w, h, pixels))
+}
+
+/// The box of cells a picture of `w` by `h` pixels is drawn in: as big
+/// as fits in `cols` by `rows`, and never stretched. `cell` is the size
+/// of one cell in pixels.
+pub fn fit(w: usize, h: usize, cell: (u16, u16), cols: u16, rows: u16) -> (u16, u16) {
+    let (cw, ch) = (cell.0.max(1) as usize, cell.1.max(1) as usize);
+    let (w, h) = (w.max(1), h.max(1));
+    let high = (cols as usize * cw * h).div_ceil(w * ch);
+    if high <= rows as usize {
+        return (cols, high.max(1) as u16);
+    }
+    let wide = rows as usize * ch * w / (h * cw);
+    (wide.clamp(1, cols as usize) as u16, rows)
 }
 
 /// Whole pictures out of the encoder's stream.
@@ -93,15 +180,34 @@ pub fn decoder(w: usize, h: usize) -> std::io::Result<Child> {
 /// `00 00 01`. Two of the kinds hold picture data, and one picture's
 /// worth of them belongs together. So a new picture starts at the second
 /// picture-data unit we meet, and everything before it is one frame.
-pub struct Pictures<R: Read> {
-    src: R,
+///
+/// That shows the end of a picture only when the next one begins, and
+/// on a still screen none does. So a picture nothing has followed for a
+/// moment is whole too.
+pub struct Pictures {
+    src: mpsc::Receiver<Vec<u8>>,
     buf: Vec<u8>,
     ended: bool,
 }
 
-impl<R: Read> Pictures<R> {
-    pub fn new(src: R) -> Pictures<R> {
-        Pictures { src, buf: Vec::with_capacity(64 * 1024), ended: false }
+/// How long the encoder may be quiet before the picture in hand counts
+/// as whole. It writes a picture in one go, so this is a long time.
+const QUIET: Duration = Duration::from_millis(30);
+
+impl Pictures {
+    /// The reading is done on a thread of its own, since only a wait on
+    /// a channel can give up after a while.
+    pub fn new(mut src: impl Read + Send + 'static) -> Pictures {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            while let Ok(n) = src.read(&mut chunk) {
+                if n == 0 || tx.send(chunk[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Pictures { src: rx, buf: Vec::with_capacity(64 * 1024), ended: false }
     }
 
     /// The next whole picture, or nothing once the camera has stopped.
@@ -115,51 +221,91 @@ impl<R: Read> Pictures<R> {
             if self.ended {
                 return if self.buf.is_empty() { None } else { Some(std::mem::take(&mut self.buf)) };
             }
-            let mut chunk = [0u8; 8192];
-            match self.src.read(&mut chunk) {
-                Ok(0) => self.ended = true,
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(_) => self.ended = true,
+            let more = if units(&self.buf).any(|(_, kind)| kind == 1 || kind == 5) {
+                match self.src.recv_timeout(QUIET) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Some(std::mem::take(&mut self.buf)),
+                    more => more.ok(),
+                }
+            } else {
+                self.src.recv().ok()
+            };
+            match more {
+                Some(bytes) => self.buf.extend(bytes),
+                None => self.ended = true,
             }
         }
     }
 }
 
+/// Each unit in the buffer: where its start code begins, and what kind
+/// it is. The low five bits of the byte after the start code say that:
+/// 1 and 5 are picture data, 7 and 8 the settings that come before a
+/// keyframe, 9 a mark between two pictures.
+fn units(buf: &[u8]) -> impl Iterator<Item = (usize, u8)> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i + 3 < buf.len() {
+            let head = match (buf[i], buf[i + 1], buf[i + 2], buf[i + 3]) {
+                (0, 0, 1, _) => i + 3,
+                (0, 0, 0, 1) => i + 4,
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if head >= buf.len() {
+                return None;
+            }
+            let at = i;
+            i = head;
+            return Some((at, buf[head] & 0x1f));
+        }
+        None
+    })
+}
+
 /// Where the second picture in the buffer starts, if it has arrived.
 fn boundary(buf: &[u8]) -> Option<usize> {
     let mut seen = false;
-    let mut i = 0;
-    while i + 3 < buf.len() {
-        if buf[i] != 0 || buf[i + 1] != 0 {
-            i += 1;
-            continue;
-        }
-        let head = if buf[i + 2] == 1 {
-            i + 3
-        } else if buf[i + 2] == 0 && buf[i + 3] == 1 {
-            i + 4
-        } else {
-            i += 1;
-            continue;
-        };
-        if head >= buf.len() {
-            return None;
-        }
-        // The low five bits say what the unit holds. 1 and 5 are picture
-        // data; 7 and 8 are the settings that come before a keyframe.
-        let kind = buf[head] & 0x1f;
+    for (at, kind) in units(buf) {
         if kind == 1 || kind == 5 {
             if seen {
-                return Some(i);
+                return Some(at);
             }
             seen = true;
-        } else if seen && (kind == 7 || kind == 8) {
-            // Settings again means the next keyframe has begun.
-            return Some(i);
+        } else if seen && matches!(kind, 6..=9) {
+            // Settings, a note or a mark means the next picture has begun.
+            return Some(at);
         }
-        i = head;
     }
     None
+}
+
+/// Can a decoder start from this picture? A keyframe can: it holds a
+/// unit of kind 5, or the settings that come before one.
+pub fn is_key(picture: &[u8]) -> bool {
+    units(picture)
+        .find_map(|(_, kind)| match kind {
+            5 | 7 => Some(true),
+            1 => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// A picture as the decoder is given it: with a mark behind it. The
+/// decoder shows a picture when it sees the next one begin, and the
+/// mark is that beginning, so the picture shows at once. A mark the
+/// sender put in front is left out, or there would be two in a row.
+pub fn for_decoder(picture: &[u8]) -> Vec<u8> {
+    let mut first = units(picture);
+    let from = match (first.next(), first.next()) {
+        (Some((_, 9)), Some((next, _))) => next,
+        _ => 0,
+    };
+    let mut out = picture[from..].to_vec();
+    out.extend([0, 0, 0, 1, 0x09, 0xf0]);
+    out
 }
 
 /// The pieces of one picture, as they arrive.
@@ -233,6 +379,109 @@ mod tests {
         assert_eq!(p.next_picture().map(|f| f.len()), Some(45));
         assert_eq!(p.next_picture().map(|f| f.len()), Some(55));
         assert!(p.next_picture().is_none(), "and then the camera has stopped");
+    }
+
+    /// The encoder on a still screen: it writes one part, then nothing
+    /// for a while, then the next.
+    struct Slow(Vec<Vec<u8>>);
+
+    impl Read for Slow {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let part = self.0.remove(0);
+            if part.is_empty() {
+                std::thread::sleep(Duration::from_millis(400));
+                return self.read(buf);
+            }
+            buf[..part.len()].copy_from_slice(&part);
+            Ok(part.len())
+        }
+    }
+
+    #[test]
+    fn a_picture_nothing_follows_is_sent_without_waiting_for_the_next() {
+        let key: Vec<u8> = [nal(7, 10), nal(8, 4), nal(5, 300)].concat();
+        let began = std::time::Instant::now();
+        let mut p = Pictures::new(Slow(vec![key.clone(), Vec::new(), nal(1, 40)]));
+        assert_eq!(p.next_picture(), Some(key));
+        assert!(began.elapsed() < Duration::from_millis(300), "it waited for the next picture");
+        assert_eq!(p.next_picture(), Some(nal(1, 40)));
+        assert_eq!(p.next_picture(), None);
+    }
+
+    #[test]
+    fn the_settings_alone_are_not_a_picture_yet() {
+        // The settings come first and the picture data a moment later:
+        // that pause must not cut the keyframe in two.
+        let mut p = Pictures::new(Slow(vec![[nal(7, 10), nal(8, 4)].concat(), Vec::new(), nal(5, 300)]));
+        assert_eq!(p.next_picture().map(|f| f.len()), Some(15 + 9 + 305));
+    }
+
+    #[test]
+    fn a_keyframe_is_told_from_the_pictures_that_need_one() {
+        assert!(is_key(&[nal(7, 10), nal(8, 4), nal(5, 300)].concat()));
+        assert!(is_key(&[nal(9, 1), nal(5, 300)].concat()));
+        assert!(!is_key(&nal(1, 40)));
+        assert!(!is_key(&[nal(9, 1), nal(1, 40)].concat()));
+        assert!(!is_key(b"no picture at all"));
+    }
+
+    #[test]
+    fn the_decoder_gets_one_mark_behind_each_picture() {
+        let mark = [0u8, 0, 0, 1, 0x09, 0xf0];
+        assert_eq!(for_decoder(&nal(1, 40)), [nal(1, 40), mark.to_vec()].concat());
+        // A sender that marks the front of its pictures: that mark goes,
+        // or the decoder would get two in a row and find no picture between.
+        let marked = [nal(9, 1), nal(1, 40)].concat();
+        assert_eq!(for_decoder(&marked), [nal(1, 40), mark.to_vec()].concat());
+    }
+
+    #[test]
+    fn the_encoder_is_told_what_each_kind_of_picture_needs() {
+        let has = |args: &[String], words: &[&str]| args.windows(words.len()).any(|w| w == words);
+        let chip = encoder_args("/dev/video0", true, ":0");
+        assert!(has(&chip, &["-c:v", "h264_vaapi", "-async_depth", "1"]), "the chip gives each picture back at once");
+        assert!(has(&chip, &["-profile:v", "constrained_baseline"]));
+        assert!(has(&chip, &["-fps_mode", "passthrough"]), "no empty pictures where the gate dropped one");
+        // libx264 refuses the name the chip's encoder takes.
+        let soft = encoder_args("test", false, ":0");
+        assert!(has(&soft, &["-c:v", "libx264"]) && has(&soft, &["-profile:v", "baseline"]));
+        assert!(!soft.iter().any(|a| a.contains("vaapi") || a.contains("hwupload")));
+        // The screen: grabbed from the display, and looked at for changes before it is scaled.
+        let screen = encoder_args("screen", true, ":7");
+        assert!(has(&screen, &["-f", "x11grab", "-framerate", "5", "-i", ":7"]));
+        let chain = &screen[screen.iter().position(|a| a == "-vf").unwrap() + 1];
+        assert!(chain.find("mpdecimate").unwrap() < chain.find("scale=").unwrap(), "{chain}");
+        assert!(chain.ends_with("format=nv12,hwupload"));
+    }
+
+    #[test]
+    fn a_decoded_picture_reads_back_with_its_size() {
+        let mut stream = b"P6\n3 2\n255\n".to_vec();
+        stream.extend([7u8; 18]);
+        stream.extend(b"P6\n1 1\n255\n");
+        stream.extend([9u8; 3]);
+        stream.extend(b"P6\n4 4\n255\n"); // and the decoder stops half way
+        stream.extend([1u8; 10]);
+        let mut src = std::io::Cursor::new(stream);
+        assert_eq!(read_picture(&mut src), Some((3, 2, vec![7u8; 18])));
+        assert_eq!(read_picture(&mut src), Some((1, 1, vec![9u8; 3])));
+        assert_eq!(read_picture(&mut src), None, "half a picture is no picture");
+        assert_eq!(read_picture(&mut std::io::Cursor::new(b"JUNK and more".to_vec())), None);
+    }
+
+    #[test]
+    fn a_picture_fills_its_box_without_being_stretched() {
+        // Cells 10 wide and 20 high. A camera's 4:3 in 40 columns.
+        assert_eq!(fit(480, 360, (10, 20), 40, 30), (40, 15));
+        // A screen in a window 200 columns wide and 40 rows high: the
+        // rows run out first, so it is narrower than the window.
+        assert_eq!(fit(1152, 720, (10, 20), 200, 40), (128, 40));
+        // A phone held upright.
+        assert_eq!(fit(360, 640, (10, 20), 40, 20), (22, 20));
+        assert_eq!(fit(0, 0, (0, 0), 40, 20), (20, 20), "nonsense in, a box out");
     }
 
     #[test]

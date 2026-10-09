@@ -27,6 +27,9 @@ The room's name is also the key to the call, so pick one nobody would guess. See
 | Key | Does |
 |---|---|
 | `m` | Mute, and unmute |
+| `v` | The camera, off and on (when the call was started with one) |
+| `s` | Share your screen, and stop sharing it |
+| `z` | The far end's picture big, and small again |
 | `q` | Hang up |
 
 ## The echo
@@ -62,6 +65,22 @@ The same idea as the sound gate runs here. Frames that look like the one before 
 - A picture is bigger than a packet, so it goes in pieces. A piece that never arrives costs that one picture, and the next whole one replaces it.
 
 The far end's picture is drawn in real pixels, which needs a terminal that shows them (glass, kitty, WezTerm). Anywhere else the call is sound only.
+
+## Your screen
+
+`s` shows your screen to the room in place of the camera, and `s` again stops it. For as long as it lasts, the row with your name says in red that your screen is shared.
+
+- The whole screen goes out, scaled to fit in 1280 by 720.
+- hush looks at the screen five times a second and sends only what changed. A still screen sends nothing.
+- A 1920 by 1080 screen full of text was 34 kB for the first picture. Each scroll of the text cost about as much.
+- A pointer that moved was about 500 bytes.
+- The looking costs 8% of one core while you share, and nothing when you do not.
+
+`z` draws the far end's picture as big as the window takes. A screen is hard to read at the size of a face.
+
+Someone who joins later sees it at once. The picture begins again when a new name comes into the room.
+
+The screen is read from X11. A browser can watch a shared screen and cannot share its own.
 
 ## In a browser
 
@@ -151,7 +170,7 @@ sudo apt install libopus-dev
 cargo install --path .
 ```
 
-`arecord` and `aplay` do the sound, so there is no audio library to build against beyond Opus itself.
+`arecord` and `aplay` do the sound, so there is no audio library to build against beyond Opus itself. The camera, the screen and the far end's picture go through `ffmpeg`, version 5.1 or newer.
 
 ## Files
 

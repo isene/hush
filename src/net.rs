@@ -87,11 +87,14 @@ pub fn speech(seq: u32, opus: &[u8]) -> Vec<u8> {
     p
 }
 
-/// A piece of a picture, before it is sealed: which picture this is,
-/// which piece of it, and how many pieces there are. A picture is far
-/// too big for one packet, so it goes in pieces.
-pub fn picture(frame: u32, index: u16, count: u16, chunk: &[u8]) -> Vec<u8> {
-    let mut p = frame.to_le_bytes().to_vec();
+/// A piece of a picture, before it is sealed: which run of pictures it
+/// belongs to, which picture this is, which piece of it, and how many
+/// pieces there are. A picture is far too big for one packet, so it
+/// goes in pieces. A run is one camera or one screen from start to
+/// stop; the far end starts its decoder afresh for each.
+pub fn picture(run: u8, frame: u32, index: u16, count: u16, chunk: &[u8]) -> Vec<u8> {
+    let mut p = vec![run];
+    p.extend(frame.to_le_bytes());
     p.extend(index.to_le_bytes());
     p.extend(count.to_le_bytes());
     p.extend(chunk);
@@ -99,7 +102,7 @@ pub fn picture(frame: u32, index: u16, count: u16, chunk: &[u8]) -> Vec<u8> {
 }
 
 /// The most of a picture that fits in one packet.
-pub const CHUNK_MAX: usize = PACKET_MAX - HEAD - NONCE - TAG - 8;
+pub const CHUNK_MAX: usize = PACKET_MAX - HEAD - NONCE - TAG - 9;
 
 /// A line of text, before it is sealed: a number of its own, so the
 /// far end shows it once however many times it arrives, and the text.
@@ -119,7 +122,7 @@ pub const LINE_MAX: usize = PACKET_MAX - HEAD - NONCE - TAG - 4;
 /// What a client made of a packet that arrived.
 pub enum In {
     Speech { from: String, seq: u32, opus: Vec<u8> },
-    Picture { from: String, frame: u32, index: u16, count: u16, chunk: Vec<u8> },
+    Picture { from: String, run: u8, frame: u32, index: u16, count: u16, chunk: Vec<u8> },
     Line { from: String, id: u32, text: String },
     Who(Vec<String>),
     Other,
@@ -131,12 +134,13 @@ pub fn read(kind: u8, from: String, body: &[u8]) -> In {
     let n = |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
     match kind {
         AUDIO if body.len() > 4 => In::Speech { from, seq: n(0), opus: body[4..].to_vec() },
-        VIDEO if body.len() > 8 => In::Picture {
+        VIDEO if body.len() > 9 => In::Picture {
             from,
-            frame: n(0),
-            index: u16::from_le_bytes([body[4], body[5]]),
-            count: u16::from_le_bytes([body[6], body[7]]),
-            chunk: body[8..].to_vec(),
+            run: body[0],
+            frame: n(1),
+            index: u16::from_le_bytes([body[5], body[6]]),
+            count: u16::from_le_bytes([body[7], body[8]]),
+            chunk: body[9..].to_vec(),
         },
         TEXT if body.len() > 4 => In::Line { from, id: n(0), text: String::from_utf8_lossy(&body[4..]).into_owned() },
         _ => In::Other,
@@ -409,9 +413,9 @@ mod tests {
 
     #[test]
     fn a_piece_of_a_picture_reads_back_as_it_was_sent() {
-        match read(VIDEO, "geir".into(), &picture(12, 1, 4, &[3, 3, 3])) {
-            In::Picture { from, frame, index, count, chunk } => {
-                assert_eq!((from.as_str(), frame, index, count), ("geir", 12, 1, 4));
+        match read(VIDEO, "geir".into(), &picture(200, 12, 1, 4, &[3, 3, 3])) {
+            In::Picture { from, run, frame, index, count, chunk } => {
+                assert_eq!((from.as_str(), run, frame, index, count), ("geir", 200, 12, 1, 4));
                 assert_eq!(chunk, vec![3, 3, 3]);
             }
             _ => panic!("a piece of a picture came back as something else"),
