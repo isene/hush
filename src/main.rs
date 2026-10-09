@@ -108,7 +108,13 @@ struct State {
     /// Set when a key asks for the microphone to be held shut.
     muted: bool,
     last_in: Option<Instant>,
+    /// The lines of text written to the room: who wrote each, and what.
+    said: Vec<(String, String)>,
 }
+
+/// How many lines of text the call screen shows, and how many are kept.
+const SAID_ROWS: usize = 5;
+const SAID_KEPT: usize = 50;
 
 /// Counters that two threads touch, so they are kept apart from the rest.
 struct Tally {
@@ -415,7 +421,8 @@ fn help() {
     println!("  --relay PORT  be the relay instead of joining a call");
     println!();
     println!("In a call: m mutes, v is the camera, s shares the screen, z shows");
-    println!("the far end's picture big, q hangs up.");
+    println!("the far end's picture big, t writes a line of text to the room,");
+    println!("y copies the last line that came, q hangs up.");
     println!();
     println!("PipeWire's echo canceller is used when it is there, so the far end");
     println!("does not hear itself. Headphones are still the safer answer.");
@@ -450,6 +457,7 @@ fn call(
         open: false,
         muted: false,
         last_in: None,
+        said: Vec::new(),
     }));
     let tally = Arc::new(Tally {
         sent_bytes: AtomicU64::new(0),
@@ -505,7 +513,8 @@ fn call(
         }
     });
 
-    screen(room, name, server, aec, &state, &tally, &going, &vid, &ask);
+    let write = |id: u32, text: &str| lock.seal(&net::head(net::TEXT, &wire, name), &net::line(id, text));
+    screen(room, name, server, aec, &state, &tally, &going, &vid, &ask, &sock, &write);
 
     going.store(false, Ordering::Relaxed);
     vid.stop();
@@ -610,6 +619,8 @@ fn hear(
     let mut into_decoder: Option<std::process::ChildStdin> = None;
     // Which run of pictures is being decoded: one camera or one screen.
     let mut showing: Option<u8> = None;
+    // The lines of text already shown, by who wrote them and their number.
+    let mut read_lines: Vec<(String, u32)> = Vec::new();
     while going.load(Ordering::Relaxed) {
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
@@ -679,7 +690,23 @@ fn hear(
                     let _ = ask.send(source);
                 }
             }
-            net::In::Line { .. } | net::In::Other => {}
+            net::In::Line { from, id, text } => {
+                tally.recv_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                // A line is sent three times, in case one gets lost.
+                // It is shown once.
+                if !read_lines.contains(&(from.clone(), id)) {
+                    read_lines.push((from.clone(), id));
+                    if read_lines.len() > 64 {
+                        read_lines.remove(0);
+                    }
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.said.push((from, text));
+                    if s.said.len() > SAID_KEPT {
+                        s.said.remove(0);
+                    }
+                }
+            }
+            net::In::Other => {}
         }
     }
 }
@@ -879,9 +906,13 @@ fn screen(
     going: &Arc<AtomicBool>,
     vid: &Arc<Vid>,
     ask: &mpsc::Sender<String>,
+    sock: &UdpSocket,
+    write: &dyn Fn(u32, &str) -> Vec<u8>,
 ) {
     Crust::init();
     Crust::set_app_identity("Hush");
+    // A paste comes as one piece, so a line end in it sends nothing early.
+    Crust::enable_bracketed_paste();
     let (cols, rows) = Crust::terminal_size();
     let mut status = Pane::new(1, rows, cols, 1, 250, 236);
     status.scroll = false;
@@ -900,12 +931,48 @@ fn screen(
     let mut boxed = (0u16, 0u16);
     // A screen can be shared where there is one to grab.
     let can_share = std::env::var_os("DISPLAY").is_some();
+    // The line being typed for the room, when there is one.
+    let mut typing: Option<String> = None;
+    // Lines on their way out: each goes three times, a second apart,
+    // since there is no asking again for one that got lost.
+    let mut outbox: Vec<(Vec<u8>, u8, Instant)> = Vec::new();
+    // Each line's own number. It begins anywhere, so a call joined
+    // twice under one name does not repeat the numbers of the first.
+    let mut line_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // The rows the text took at the last pass, and whether y just copied.
+    let mut talk_rows = 0u16;
+    let mut copied = false;
     // The last row the pass before this one wrote on.
     let mut reached = 0u16;
 
     while going.load(Ordering::Relaxed) {
+        outbox.retain_mut(|(packet, left, due)| {
+            if *due <= Instant::now() {
+                if sock.send(packet).is_ok() {
+                    tally.sent_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                }
+                *left -= 1;
+                *due += Duration::from_secs(1);
+            }
+            *left > 0
+        });
+        let got_a_line;
         {
             let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            got_a_line = s.said.iter().any(|(who, _)| who != name);
+            // The text under the counts: an empty row, the lines, and
+            // the one being typed.
+            let lines = s.said.len().min(SAID_ROWS);
+            let now_rows = if lines > 0 || typing.is_some() { 1 + lines as u16 + typing.is_some() as u16 } else { 0 };
+            if now_rows != talk_rows {
+                // The picture above gives up rows or gets them back, so
+                // it is drawn again though nothing new has come.
+                talk_rows = now_rows;
+                vid.seen.lock().unwrap_or_else(|e| e.into_inner()).fresh = true;
+            }
             let secs = began.elapsed().as_secs_f64();
             let sent = tally.sent_bytes.load(Ordering::Relaxed);
             let recv = tally.recv_bytes.load(Ordering::Relaxed);
@@ -940,7 +1007,7 @@ fn screen(
                 if seen.fresh && !seen.pixels.is_empty() {
                     // The rows under the picture: the meters, the
                     // people, the counts, the bar at the bottom.
-                    let under = 9 + s.here.len() as u16;
+                    let under = 9 + s.here.len() as u16 + talk_rows;
                     let most = (if big { cols.saturating_sub(4) } else { 40 }, rows.saturating_sub(under));
                     let fits = video::fit(seen.w, seen.h, cell, most.0.max(8), most.1.max(4));
                     if fits != boxed {
@@ -1062,6 +1129,37 @@ fn screen(
                 ),
                 seq::ERASE_EOL
             );
+            if talk_rows > 0 {
+                row += 1;
+                print!("{}{}", move_to(row, 1), seq::ERASE_EOL);
+            }
+            for (who, text) in &s.said[s.said.len() - lines..] {
+                row += 1;
+                let who = if who == name { "you" } else { who.as_str() };
+                let room = (cols as usize).saturating_sub(crust::display_width(who) + 5);
+                print!(
+                    "{}  {} {}{}",
+                    move_to(row, 1),
+                    style::rgb(&format!("{who}:"), Some(HEAD_RGB), None, "b"),
+                    linked(text, room),
+                    seq::ERASE_EOL
+                );
+            }
+            if let Some(line) = &typing {
+                row += 1;
+                // The end of the line, when it is longer than the row.
+                let room = (cols as usize).saturating_sub(6);
+                let skip = line.chars().count().saturating_sub(room);
+                let tail: String = line.chars().skip(skip).collect();
+                print!(
+                    "{}  {} {}{}{}",
+                    move_to(row, 1),
+                    style::rgb(">", Some(RUST_RGB), None, "b"),
+                    tail,
+                    style::reverse(" "),
+                    seq::ERASE_EOL
+                );
+            }
             // Someone left, so the list is shorter: wipe what the last
             // pass wrote below this one.
             for r in row + 1..=reached {
@@ -1069,14 +1167,25 @@ fn screen(
             }
             reached = row;
         }
-        status.say(&format!(
-            " {}  {}  {}  {}  {}",
-            style::rgb("m", Some(HEAD_RGB), None, "b"),
-            style::dim("mute · q hangs up"),
-            style::dim(if aec { "echo cancelled" } else { "no echo cancelling · wear headphones" }),
-            style::dim(&picture_keys(vid.source.is_some(), vid.on(), vid.shares(), can_share, drawn, big)),
-            style::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
-        ));
+        if typing.is_some() {
+            // Every key is a letter now, so the bar names the two that are not.
+            status.say(&format!(" {}", style::dim("enter sends the line · esc drops it")));
+        } else {
+            status.say(&format!(
+                " {}  {}  {}  {}  {}  {}",
+                style::rgb("m", Some(HEAD_RGB), None, "b"),
+                style::dim("mute · q hangs up"),
+                style::dim(&picture_keys(vid.source.is_some(), vid.on(), vid.shares(), can_share, drawn, big)),
+                style::dim(match (got_a_line, copied) {
+                    (false, _) => "t writes a line",
+                    (true, false) => "t writes a line · y copies the last one",
+                    (true, true) => "t writes a line · copied",
+                }),
+                // The keys come first: a narrow window cuts the bar's end.
+                style::dim(if aec { "echo cancelled" } else { "no echo cancelling · wear headphones" }),
+                style::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            ));
+        }
         std::io::stdout().flush().ok();
 
         // Milliseconds: getchr's own timeout counts in seconds, which left
@@ -1085,8 +1194,39 @@ fn screen(
         // five looks a second, which is what the meters need.
         let wait = if vid.source.is_some() || drawn { 60 } else { 200 };
         if let Some(key) = Input::getchr_ms(wait) {
+            copied = false;
+            if let Some(line) = typing.as_mut() {
+                match type_key(line, &key) {
+                    Typed::More => {}
+                    Typed::Drop => typing = None,
+                    Typed::Send => {
+                        let text = typing.take().unwrap_or_default();
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            line_id = line_id.wrapping_add(1);
+                            outbox.push((write(line_id, text), 3, Instant::now()));
+                            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                            s.said.push((name.to_string(), text.to_string()));
+                            if s.said.len() > SAID_KEPT {
+                                s.said.remove(0);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             match key.as_str() {
                 "q" | "ESC" => break,
+                "t" => typing = Some(String::new()),
+                "y" => {
+                    // The last line someone else wrote: the link or the
+                    // number that was the reason to write it.
+                    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((_, text)) = s.said.iter().rev().find(|(who, _)| who != name) {
+                        crust::clipboard_copy(text, "clipboard");
+                        copied = true;
+                    }
+                }
                 "m" => {
                     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.muted = !s.muted;
@@ -1125,7 +1265,74 @@ fn screen(
     if let Some(old) = shown {
         print!("{}", glow::kitty_forget(old));
     }
+    Crust::disable_bracketed_paste();
     Crust::cleanup();
+}
+
+/// What a key did to the line being typed.
+#[derive(Debug, PartialEq)]
+enum Typed {
+    More,
+    Send,
+    Drop,
+}
+
+/// One key into the line being typed: a letter, a whole paste, or one
+/// of the keys that end it. A paste may have line ends and tabs in it;
+/// they go in as spaces. The line never grows past what a packet takes.
+fn type_key(line: &mut String, key: &str) -> Typed {
+    match key {
+        "ENTER" => return Typed::Send,
+        "ESC" => return Typed::Drop,
+        "BACK" => {
+            line.pop();
+        }
+        _ => {
+            let text = key.strip_prefix("PASTE\0").or((key.chars().count() == 1).then_some(key));
+            for c in text.unwrap_or("").chars() {
+                if line.len() + c.len_utf8() > net::LINE_MAX {
+                    break;
+                }
+                line.push(if c.is_control() { ' ' } else { c });
+            }
+        }
+    }
+    Typed::More
+}
+
+/// A line of text for the screen, cut to the room there is. Each web
+/// address is a link, and it still goes to the whole address when its
+/// letters had to be cut.
+fn linked(text: &str, room: usize) -> String {
+    let mut out = String::new();
+    let mut left = room;
+    for (i, word) in text.split(' ').enumerate() {
+        if i > 0 {
+            if left == 0 {
+                break;
+            }
+            out.push(' ');
+            left -= 1;
+        }
+        let mut shown = String::new();
+        for c in word.chars() {
+            let wide = crust::display_width(c.encode_utf8(&mut [0; 4]));
+            if wide > left {
+                break;
+            }
+            shown.push(c);
+            left -= wide;
+        }
+        if word.starts_with("http://") || word.starts_with("https://") {
+            out.push_str(&style::hyperlink(word, &style::underline(&shown)));
+        } else {
+            out.push_str(&shown);
+        }
+        if shown.len() < word.len() {
+            break;
+        }
+    }
+    out
 }
 
 /// The keys for pictures, as the bar at the bottom names them: only the
@@ -1175,6 +1382,34 @@ mod tests {
         let soft = meter(0.002, 0.001, true, 30).matches('█').count();
         let loud = meter(0.2, 0.001, true, 30).matches('█').count();
         assert!(loud > soft, "a shout lights more of the bar than a whisper");
+    }
+
+    #[test]
+    fn a_line_is_typed_pasted_and_ended() {
+        let mut line = String::new();
+        for key in ["h", "i", " ", "x", "BACK", "UP", "C-A"] {
+            assert_eq!(type_key(&mut line, key), Typed::More);
+        }
+        assert_eq!(line, "hi ", "a key with a name types nothing");
+        type_key(&mut line, "PASTE\0https://example.org/a\nsecond\tline");
+        assert_eq!(line, "hi https://example.org/a second line");
+        assert_eq!(type_key(&mut line, "ENTER"), Typed::Send);
+        assert_eq!(type_key(&mut line, "ESC"), Typed::Drop);
+        // A paste far too long stops where a packet is full, between letters.
+        let mut long = String::new();
+        type_key(&mut long, &format!("PASTE\0{}", "æ".repeat(2000)));
+        assert!(long.len() <= net::LINE_MAX && long.len() > net::LINE_MAX - 2);
+        assert!(long.chars().all(|c| c == 'æ'));
+    }
+
+    #[test]
+    fn a_web_address_is_a_link_that_survives_being_cut() {
+        assert_eq!(linked("call 555 0100", 40), "call 555 0100");
+        assert_eq!(linked("call 555 0100", 7), "call 55");
+        let whole = "https://example.org/a/long/way";
+        let line = linked(&format!("see {whole} now"), 14);
+        assert_eq!(line, format!("see {}", style::hyperlink(whole, &style::underline("https://ex"))));
+        assert_eq!(linked("", 10), "");
     }
 
     #[test]

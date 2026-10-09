@@ -49,7 +49,14 @@ pub fn fixed(s: &str, n: usize) -> Vec<u8> {
 
 /// The text back out of a padded field.
 pub fn unfixed(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).trim_end_matches('\0').to_string()
+    clean(&String::from_utf8_lossy(b))
+}
+
+/// Text from the far end, as it may be put on a screen: without the
+/// control letters a terminal would take as orders. A name or a line
+/// could otherwise set a window title or fill a clipboard.
+pub fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// The start of a packet. `room` is what the relay may see of the room:
@@ -142,7 +149,7 @@ pub fn read(kind: u8, from: String, body: &[u8]) -> In {
             count: u16::from_le_bytes([body[7], body[8]]),
             chunk: body[9..].to_vec(),
         },
-        TEXT if body.len() > 4 => In::Line { from, id: n(0), text: String::from_utf8_lossy(&body[4..]).into_owned() },
+        TEXT if body.len() > 4 => In::Line { from, id: n(0), text: clean(&String::from_utf8_lossy(&body[4..])) },
         _ => In::Other,
     }
 }
@@ -389,6 +396,17 @@ mod tests {
                 assert_eq!(opus, vec![9, 8, 7]);
             }
             _ => panic!("a frame of speech came back as something else"),
+        }
+    }
+
+    #[test]
+    fn nothing_from_the_far_end_can_give_the_terminal_orders() {
+        // A name that tries to set the window title, and a line that
+        // tries to fill the clipboard.
+        assert_eq!(sender(&head(AUDIO, "abc", "eve\x1b]0;x\x07")), "eve]0;x");
+        match read(TEXT, "eve".into(), &line(1, "hi\x1b]52;c;AAAA\x07 there\r\n")) {
+            In::Line { text, .. } => assert_eq!(text, "hi]52;c;AAAA there"),
+            _ => panic!("a line of text was not read as one"),
         }
     }
 

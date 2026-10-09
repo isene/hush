@@ -36,6 +36,9 @@
   .keys { display:flex; gap:10px; }
   .keys button { flex:1; }
   .warn { color:var(--warm); font-size:13px; }
+  .lines { font-size:14px; margin:10px 0; overflow-wrap:anywhere; }
+  .lines b { color:var(--warm); font-weight:600; margin-right:6px; }
+  .lines a { color:var(--live); }
 </style>
 </head>
 <body>
@@ -63,6 +66,8 @@
     <video id="self" class="hide" muted playsinline></video>
     <p class="tally" id="tally">nothing sent yet</p>
     <p class="tally" id="share"></p>
+    <div class="lines" id="lines"></div>
+    <input id="say" placeholder="write a line to the room" autocomplete="off" maxlength="1100">
     <div class="keys">
       <button id="mute" class="off">Mute</button>
       <button id="cam" class="off">Camera</button>
@@ -82,6 +87,7 @@ const HEAD = 1 + ROOM_LEN + NAME_MAX;
 const NONCE = 12, TAG = 16;
 const PACKET_MAX = 1200;
 const CHUNK_MAX = PACKET_MAX - HEAD - NONCE - TAG - 9;
+const LINE_MAX = PACKET_MAX - HEAD - NONCE - TAG - 4;
 const RATE = 48000, FRAME = 960;      // twenty milliseconds
 
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -217,6 +223,8 @@ let here = [], loud = {};
 // video
 let camOn = false, vEnc = null, vDec = null, vTrack = null, vTimer = null;
 let vFrame = 0, vRun = Date.now() & 255, joining = null, lastSmall = null, small = null;
+// text: the lines shown, each line's own number, and the ones already shown
+let lines = [], lineId = (Math.random() * 0xffffffff) >>> 0, seenLines = [];
 
 function say(what) { $('warn').textContent = what; }
 
@@ -255,7 +263,51 @@ async function took(p) {
     // from start to stop. A new run begins with a picture a decoder
     // can start from, so nothing has to be done about it here.
     joinPicture(v.getUint32(1, true), v.getUint16(5, true), v.getUint16(7, true), body.slice(9));
+  } else if (p[0] === TEXT && body.length > 4) {
+    // A line is sent three times, in case one gets lost. It is shown once.
+    const key = from + ' ' + v.getUint32(0, true);
+    if (seenLines.includes(key)) return;
+    seenLines.push(key);
+    if (seenLines.length > 64) seenLines.shift();
+    showLine(from, dec.decode(body.slice(4)).replace(/[\u0000-\u001f\u007f-\u009f]/g, ''));
   }
+}
+
+// Everything goes in as text, never as markup. A web address becomes a
+// link, and only an address that begins with http can be one.
+function showLine(who, text) {
+  lines.push([who, text]);
+  const row = document.createElement('div'), by = document.createElement('b');
+  by.textContent = who;
+  row.append(by);
+  for (const word of text.split(' ')) {
+    if (/^https?:\/\//.test(word)) {
+      const a = document.createElement('a');
+      a.href = word; a.textContent = word; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      row.append(a, ' ');
+    } else {
+      row.append(word + ' ');
+    }
+  }
+  $('lines').append(row);
+  while ($('lines').children.length > 20) $('lines').firstChild.remove();
+}
+
+function sayLine() {
+  let text = $('say').value.trim();
+  $('say').value = '';
+  if (!text || !ws) return;
+  while (enc.encode(text).length > LINE_MAX) text = [...text].slice(0, -1).join('');
+  const bytes = enc.encode(text), body = new Uint8Array(4 + bytes.length);
+  lineId = (lineId + 1) >>> 0;
+  new DataView(body.buffer).setUint32(0, lineId, true);
+  body.set(bytes, 4);
+  // Three times, a second apart: there is no asking again for a line
+  // that got lost.
+  for (const wait of [0, 1000, 2000]) {
+    setTimeout(() => { if (ws && ws.readyState === 1) send(TEXT, body); }, wait);
+  }
+  showLine('you', text);
 }
 
 function drawWho() {
@@ -274,6 +326,7 @@ function drawWho() {
 async function start() {
   room = $('room').value.trim() || 'kitchen';
   me = $('name').value.trim() || 'someone';
+  lines = []; seenLines = []; $('lines').textContent = '';
   if (!window.crypto || !crypto.subtle) { say('the call is sealed, and this page can only do that over https'); return; }
   if (!window.AudioEncoder) { say('this browser cannot encode Opus; try Chrome, Edge or Safari 17'); return; }
   try {
@@ -521,6 +574,7 @@ $('join').onclick = start;
 $('leave').onclick = stop;
 $('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', !muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
 $('cam').onclick = () => camera(!camOn);
+$('say').onkeydown = e => { if (e.key === 'Enter') sayLine(); };
 window.addEventListener('beforeunload', () => { try { ws && ws.send(head(LEAVE)); } catch (e) {} });
 </script>
 </body>

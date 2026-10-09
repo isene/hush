@@ -30,6 +30,8 @@ The room's name is also the key to the call, so pick one nobody would guess. See
 | `v` | The camera, off and on (when the call was started with one) |
 | `s` | Share your screen, and stop sharing it |
 | `z` | The far end's picture big, and small again |
+| `t` | Write a line of text to the room |
+| `y` | Copy the last line that came |
 | `q` | Hang up |
 
 ## The echo
@@ -81,6 +83,19 @@ The far end's picture is drawn in real pixels, which needs a terminal that shows
 Someone who joins later sees it at once. The picture begins again when a new name comes into the room.
 
 The screen is read from X11. A browser can watch a shared screen and cannot share its own.
+
+## A line of text
+
+A link or a phone number is hard to say out loud. `t` opens a line under the counts. Type or paste, and Enter sends it to everyone in the room. Esc drops it.
+
+- The last five lines stay on the screen, each with the name of who wrote it.
+- A web address is a link, where the terminal has links.
+- `y` copies the last line someone else wrote.
+- A line is sealed like the voice, and it is stored nowhere. It is gone when you hang up.
+- Someone who joins later does not get the lines from before.
+- A line can be about 1,100 letters long.
+
+The web page has the same line as a box under the picture.
 
 ## In a browser
 
