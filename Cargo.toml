@@ -1,6 +1,6 @@
 [package]
 name = "hush"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "A voice call that sends nothing while you are quiet"
 license = "Unlicense"
@@ -14,12 +14,19 @@ tungstenite = "0.24"
 audiopus = { version = "0.2", optional = true }
 crust = { version = "0.1", path = "../crust", package = "fe2o3-crust", optional = true }
 glow = { version = "0.1", path = "../glow", package = "fe2o3-glow", optional = true }
+# The lock on the call. AES-GCM seals each packet, and PBKDF2 turns the
+# room's name into the key. Both are in every browser too, so the web
+# page does the same with no library at all.
+aes-gcm = { version = "0.10", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [features]
-# The caller needs Opus and a terminal library. The relay needs neither,
-# so a server can build it with nothing else installed.
+# The caller needs Opus, a terminal library and the lock. The relay needs
+# none of them, so a server can build it with nothing else installed.
 default = ["caller"]
-caller = ["dep:audiopus", "dep:crust", "dep:glow"]
+caller = ["dep:audiopus", "dep:crust", "dep:glow", "dep:aes-gcm", "dep:pbkdf2", "dep:hmac", "dep:sha2"]
 
 [[bin]]
 name = "hush"

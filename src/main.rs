@@ -12,8 +12,13 @@
 //!
 //! Neither end can reach the other through a home router, so both send
 //! to a relay with a real address. Run one with `hush --relay`.
+//!
+//! What goes through the relay is sealed with a key made from the
+//! room's name, so the relay and the networks on the way carry the call
+//! without being able to hear it.
 
 mod audio;
+mod secret;
 mod video;
 
 use hush::net;
@@ -381,7 +386,9 @@ fn help() {
     println!("Usage: hush <room> [-n NAME] [-s HOST:PORT]");
     println!("       hush --relay [PORT]");
     println!();
-    println!("  <room>        the room to join; anyone using the same word is on the call");
+    println!("  <room>        the room to join; anyone using the same word is on the call.");
+    println!("                The word is also the key the call is sealed with, so");
+    println!("                pick one nobody would guess");
     println!("  -n NAME       what the others see you as (default: your login name)");
     println!("  -s HOST:PORT  the relay to go through (default: the line in ~/.hush)");
     println!("  --mic DEVICE  an ALSA device other than the default");
@@ -410,7 +417,11 @@ fn call(
         .ok_or_else(|| std::io::Error::other(format!("cannot find {server}")))?;
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.connect(addr)?;
-    sock.send(&net::join(room, name))?;
+    // The key, made from the room's name. From here on the name stays
+    // on this machine: the relay is told `lock.room` in its place.
+    let lock = Arc::new(secret::Lock::for_room(room));
+    let wire = lock.room.clone();
+    sock.send(&net::join(&wire, name))?;
 
     let state = Arc::new(Mutex::new(State {
         here: vec![name.to_string()],
@@ -451,27 +462,27 @@ fn call(
     let waiting: Arc<Mutex<Vec<Vec<i16>>>> = Arc::new(Mutex::new(Vec::new()));
 
     let talk = std::thread::spawn({
-        let (sock, state, tally, going) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone());
-        let (room, name, mic) = (room.to_string(), name.to_string(), mic.to_string());
-        move || speak(sock, &room, &name, &mic, aec, state, tally, going)
+        let (sock, state, tally, going, lock) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone(), lock.clone());
+        let (room, name, mic) = (wire.clone(), name.to_string(), mic.to_string());
+        move || speak(sock, &lock, &room, &name, &mic, aec, state, tally, going)
     });
     let listen = std::thread::spawn({
         let (sock, state, tally, going, waiting) = (sock.try_clone()?, state.clone(), tally.clone(), going.clone(), waiting.clone());
-        let vid = vid.clone();
-        move || hear(sock, state, tally, going, waiting, vid)
+        let (vid, lock) = (vid.clone(), lock.clone());
+        move || hear(sock, &lock, state, tally, going, waiting, vid)
     });
     let play = std::thread::spawn({
         let (going, waiting, out) = (going.clone(), waiting.clone(), out.to_string());
         move || play_back(&out, aec, waiting, going)
     });
     let watch = std::thread::spawn({
-        let (sock, tally, going, vid) = (sock.try_clone()?, tally.clone(), going.clone(), vid.clone());
-        let (room, name) = (room.to_string(), name.to_string());
-        move || watch(sock, &room, &name, vid, tally, going, asked)
+        let (sock, tally, going, vid, lock) = (sock.try_clone()?, tally.clone(), going.clone(), vid.clone(), lock.clone());
+        let (room, name) = (wire.clone(), name.to_string());
+        move || watch(sock, &lock, &room, &name, vid, tally, going, asked)
     });
     let beat = std::thread::spawn({
         let (sock, going) = (sock.try_clone()?, going.clone());
-        let (room, name) = (room.to_string(), name.to_string());
+        let (room, name) = (wire.clone(), name.to_string());
         move || {
             // A packet a second holds the way open through both routers,
             // which is the only thing that has to happen during silence.
@@ -494,13 +505,14 @@ fn call(
     let _ = beat.join();
     // Last of all, once no thread can send another packet: a keepalive
     // arriving after the goodbye would put us back in the room.
-    let _ = sock.send(&net::leave(room, name));
+    let _ = sock.send(&net::leave(&wire, name));
     Ok(())
 }
 
 /// Read the microphone, decide whether it is worth sending, and send it.
 fn speak(
     sock: UdpSocket,
+    lock: &secret::Lock,
     room: &str,
     name: &str,
     mic: &str,
@@ -552,7 +564,7 @@ fn speak(
             Ok(n) => n,
             Err(_) => continue,
         };
-        let out = net::audio(room, name, seq, &packet[..n]);
+        let out = lock.seal(&net::head(net::AUDIO, room, name), &net::speech(seq, &packet[..n]));
         seq = seq.wrapping_add(1);
         if sock.send(&out).is_ok() {
             tally.sent_bytes.fetch_add(out.len() as u64, Ordering::Relaxed);
@@ -565,6 +577,7 @@ fn speak(
 /// Take packets off the wire and turn them back into sound.
 fn hear(
     sock: UdpSocket,
+    lock: &secret::Lock,
     state: Arc<Mutex<State>>,
     tally: Arc<Tally>,
     going: Arc<AtomicBool>,
@@ -587,7 +600,7 @@ fn hear(
             Ok(n) => n,
             Err(_) => continue,
         };
-        match net::parse(&buf[..n]) {
+        match lock.read(&buf[..n]) {
             net::In::Speech { from, seq, opus } => {
                 // A jump in the count is a packet that never arrived.
                 // A step back is one that arrived late, which the queue
@@ -632,7 +645,7 @@ fn hear(
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 s.here = names;
             }
-            net::In::Other => {}
+            net::In::Line { .. } | net::In::Other => {}
         }
     }
 }
@@ -667,6 +680,7 @@ fn start_decoder(vid: &Arc<Vid>, going: &Arc<AtomicBool>) -> Option<std::process
 /// again once it has been stopped.
 fn watch(
     sock: UdpSocket,
+    lock: &secret::Lock,
     room: &str,
     name: &str,
     vid: Arc<Vid>,
@@ -680,7 +694,7 @@ fn watch(
     let mut run = true;
     while going.load(Ordering::Relaxed) {
         if run {
-            send_pictures(&sock, room, name, &source, &vid, &tally, &going);
+            send_pictures(&sock, lock, room, name, &source, &vid, &tally, &going);
         }
         // Nothing wakes this up but a key asking for the camera back.
         run = asked.recv().is_ok();
@@ -692,6 +706,7 @@ fn watch(
 /// the camera throws them away before encoding them.
 fn send_pictures(
     sock: &UdpSocket,
+    lock: &secret::Lock,
     room: &str,
     name: &str,
     source: &str,
@@ -715,7 +730,7 @@ fn send_pictures(
         id += 1;
         let count = frame.chunks(net::CHUNK_MAX).count() as u16;
         for (i, chunk) in frame.chunks(net::CHUNK_MAX).enumerate() {
-            let packet = net::video(room, name, id, i as u16, count, chunk);
+            let packet = lock.seal(&net::head(net::VIDEO, room, name), &net::picture(id, i as u16, count, chunk));
             if sock.send(&packet).is_ok() {
                 tally.sent_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
             }
@@ -836,6 +851,8 @@ fn screen(
     let mut shown: Option<u32> = None;
     let mut turn = 0u32;
     let mut drawn = false;
+    // The last row the pass before this one wrote on.
+    let mut reached = 0u16;
 
     while going.load(Ordering::Relaxed) {
         {
@@ -872,6 +889,13 @@ fn screen(
             if pixels {
                 let mut seen = vid.seen.lock().unwrap_or_else(|e| e.into_inner());
                 if seen.fresh && !seen.pixels.is_empty() {
+                    if !drawn {
+                        // The meters move down to make room for the
+                        // picture: wipe the rows they stood on.
+                        for r in 3..=reached {
+                            print!("{}{}", move_to(r, 1), seq::ERASE_EOL);
+                        }
+                    }
                     let id = 90 + turn % 2;
                     turn += 1;
                     print!(
@@ -911,6 +935,7 @@ fn screen(
                 mine,
                 seq::ERASE_EOL
             );
+            print!("{}{}", move_to(row + 1, 1), seq::ERASE_EOL);
             row += 2;
 
             let others: Vec<&String> = s.here.iter().filter(|n| *n != name).collect();
@@ -942,6 +967,7 @@ fn screen(
                 row += 1;
             }
 
+            print!("{}{}", move_to(row, 1), seq::ERASE_EOL);
             row += 1;
             print!(
                 "{}  {}{}",
@@ -977,6 +1003,12 @@ fn screen(
                 ),
                 seq::ERASE_EOL
             );
+            // Someone left, so the list is shorter: wipe what the last
+            // pass wrote below this one.
+            for r in row + 1..=reached {
+                print!("{}{}", move_to(r, 1), seq::ERASE_EOL);
+            }
+            reached = row;
         }
         status.say(&format!(
             " {}  {}  {}  {}  {}",

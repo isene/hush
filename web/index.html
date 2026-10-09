@@ -74,13 +74,14 @@
 // The same packets the terminal app sends, built by hand. A browser
 // cannot send UDP, so these go over a WebSocket to the relay, which
 // passes them on to everyone else in the room whichever way they came.
-const JOIN = 1, LEAVE = 2, AUDIO = 3, PING = 4, WHO = 5, VIDEO = 6;
+const JOIN = 1, LEAVE = 2, AUDIO = 3, PING = 4, WHO = 5, VIDEO = 6, TEXT = 7;
 const ROOM_LEN = 12, NAME_MAX = 20;
 const HEAD = 1 + ROOM_LEN + NAME_MAX;
-const AUDIO_HEAD = HEAD + 4;
-const VIDEO_HEAD = HEAD + 4 + 2 + 2;
+// What sealing adds: twelve bytes no other packet has had, and sixteen
+// that prove nothing in the packet was changed on the way.
+const NONCE = 12, TAG = 16;
 const PACKET_MAX = 1200;
-const CHUNK_MAX = PACKET_MAX - VIDEO_HEAD;
+const CHUNK_MAX = PACKET_MAX - HEAD - NONCE - TAG - 8;
 const RATE = 48000, FRAME = 960;      // twenty milliseconds
 
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -94,12 +95,69 @@ function unfixed(bytes) {
   let end = bytes.indexOf(0);
   return dec.decode(bytes.slice(0, end === -1 ? bytes.length : end));
 }
-function head(kind, room, name, extra) {
-  const p = new Uint8Array(HEAD + extra);
+// The start of a packet, which is all the relay reads: what it is,
+// which room, and who sent it. The room here is twelve letters made
+// from the room's name, never the name.
+function head(kind) {
+  const p = new Uint8Array(HEAD);
   p[0] = kind;
-  p.set(fixed(room, ROOM_LEN), 1);
-  p.set(fixed(name, NAME_MAX), 1 + ROOM_LEN);
+  p.set(fixed(wire, ROOM_LEN), 1);
+  p.set(fixed(me, NAME_MAX), 1 + ROOM_LEN);
   return p;
+}
+
+// The lock on the call, the same one the terminal app makes. The key
+// comes from the room's name, so whoever knows the name is in the call
+// and nobody else can listen: not the relay, not the networks between.
+// A name that is easy to guess makes a key that is easy to guess.
+let key = null, wire = '', mine = null, count = 0;
+
+async function makeLock(name) {
+  const raw = await crypto.subtle.importKey('raw', enc.encode(name), 'PBKDF2', false, ['deriveBits']);
+  const master = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('hush room v1'), iterations: 600000 }, raw, 256);
+  const mac = await crypto.subtle.importKey('raw', master, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const k = await crypto.subtle.sign('HMAC', mac, enc.encode('key'));
+  const r = new Uint8Array(await crypto.subtle.sign('HMAC', mac, enc.encode('room')));
+  key = await crypto.subtle.importKey('raw', k, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  wire = [...r.slice(0, 6)].map(b => b.toString(16).padStart(2, '0')).join('');
+  // Eight bytes of chance for this call and a count after them: the
+  // twelve bytes no other packet has had.
+  mine = crypto.getRandomValues(new Uint8Array(8));
+  count = 0;
+}
+
+async function seal(kind, body) {
+  const h = head(kind);
+  const nonce = new Uint8Array(NONCE);
+  nonce.set(mine);
+  new DataView(nonce.buffer).setUint32(8, count++, true);
+  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, additionalData: h }, key, body));
+  const p = new Uint8Array(HEAD + NONCE + sealed.length);
+  p.set(h);
+  p.set(nonce, HEAD);
+  p.set(sealed, HEAD + NONCE);
+  return p;
+}
+
+// What was sealed in a packet, or nothing when it was sealed with
+// another room's key or changed on the way.
+async function unseal(p) {
+  if (!key || p.length < HEAD + NONCE + TAG) return null;
+  try {
+    return new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: p.slice(HEAD, HEAD + NONCE), additionalData: p.slice(0, HEAD) }, key, p.slice(HEAD + NONCE)));
+  } catch (e) { return null; }
+}
+
+// Sealing and opening take a moment each, so both go through a queue:
+// packets leave and are read in the order they came.
+let outq = Promise.resolve(), inq = Promise.resolve();
+function send(kind, body) {
+  outq = outq.then(async () => {
+    const p = await seal(kind, body);
+    if (ws && ws.readyState === 1) { ws.send(p); sent += p.length; }
+  }).catch(() => {});
 }
 
 // The gate, the same one the terminal app uses. It learns what quiet
@@ -165,32 +223,35 @@ function say(what) { $('warn').textContent = what; }
 function open(where) {
   ws = new WebSocket(where);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { ws.send(head(JOIN, room, me, 0)); beat = setInterval(() => ws.send(head(PING, room, me, 0)), 1000); };
-  ws.onmessage = e => took(new Uint8Array(e.data));
+  ws.onopen = () => { ws.send(head(JOIN)); beat = setInterval(() => ws.send(head(PING)), 1000); };
+  ws.onmessage = e => { const p = new Uint8Array(e.data); inq = inq.then(() => took(p)).catch(() => {}); };
   ws.onclose = () => { if (began) say('the line dropped'); };
   ws.onerror = () => say('cannot reach the relay');
 }
 
-function took(p) {
+async function took(p) {
   got += p.length;
   if (p[0] === WHO) {
+    // The relay's own list, which it sends as it is.
     here = [];
     for (let i = 1; i + NAME_MAX <= p.length; i += NAME_MAX) {
       const n = unfixed(p.slice(i, i + NAME_MAX));
       if (n && n !== me) here.push(n);
     }
     drawWho();
-  } else if (p[0] === AUDIO && p.length > AUDIO_HEAD && decoder) {
-    const from = unfixed(p.slice(1 + ROOM_LEN, HEAD));
-    const opus = p.slice(AUDIO_HEAD);
+    return;
+  }
+  const body = await unseal(p);
+  if (!body) return;
+  const from = unfixed(p.slice(1 + ROOM_LEN, HEAD));
+  const v = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  if (p[0] === AUDIO && body.length > 4 && decoder) {
     loud[from] = Date.now();
     try {
-      decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: performance.now() * 1000, data: opus }));
+      decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: performance.now() * 1000, data: body.slice(4) }));
     } catch (e) {}
-  } else if (p[0] === VIDEO && p.length > VIDEO_HEAD) {
-    const v = new DataView(p.buffer, p.byteOffset);
-    const frame = v.getUint32(HEAD, true), index = v.getUint16(HEAD + 4, true), count = v.getUint16(HEAD + 6, true);
-    joinPicture(frame, index, count, p.slice(VIDEO_HEAD));
+  } else if (p[0] === VIDEO && body.length > 8) {
+    joinPicture(v.getUint32(0, true), v.getUint16(4, true), v.getUint16(6, true), body.slice(8));
   }
 }
 
@@ -210,6 +271,7 @@ function drawWho() {
 async function start() {
   room = $('room').value.trim() || 'kitchen';
   me = $('name').value.trim() || 'someone';
+  if (!window.crypto || !crypto.subtle) { say('the call is sealed, and this page can only do that over https'); return; }
   if (!window.AudioEncoder) { say('this browser cannot encode Opus; try Chrome, Edge or Safari 17'); return; }
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -226,12 +288,10 @@ async function start() {
 
   encoder = new AudioEncoder({
     output: chunk => {
-      const opus = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(opus);
-      const p = head(AUDIO, room, me, 4 + opus.length);
-      new DataView(p.buffer).setUint32(AUDIO_HEAD - 4, seq++, true);
-      p.set(opus, AUDIO_HEAD);
-      if (ws && ws.readyState === 1) { ws.send(p); sent += p.length; }
+      const body = new Uint8Array(4 + chunk.byteLength);
+      new DataView(body.buffer).setUint32(0, seq++, true);
+      chunk.copyTo(body.subarray(4));
+      send(AUDIO, body);
     },
     error: e => say('encoder: ' + e.message)
   });
@@ -248,6 +308,7 @@ async function start() {
   });
   decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
 
+  await makeLock(room);
   open(document.body.dataset.relay || relayAddress());
   began = Date.now();
   $('setup').classList.add('hide');
@@ -381,14 +442,14 @@ async function cameraDo(on) {
       vFrame++;
       const count = Math.ceil(bytes.length / CHUNK_MAX);
       for (let i = 0; i < count; i++) {
-        const piece = bytes.slice(i * CHUNK_MAX, (i + 1) * CHUNK_MAX);
-        const p = head(VIDEO, room, me, 4 + 2 + 2 + piece.length);
-        const v = new DataView(p.buffer);
-        v.setUint32(HEAD, vFrame, true);
-        v.setUint16(HEAD + 4, i, true);
-        v.setUint16(HEAD + 6, count, true);
-        p.set(piece, VIDEO_HEAD);
-        if (ws && ws.readyState === 1) { ws.send(p); sent += p.length; }
+        const piece = bytes.subarray(i * CHUNK_MAX, (i + 1) * CHUNK_MAX);
+        const body = new Uint8Array(8 + piece.length);
+        const v = new DataView(body.buffer);
+        v.setUint32(0, vFrame, true);
+        v.setUint16(4, i, true);
+        v.setUint16(6, count, true);
+        body.set(piece, 8);
+        send(VIDEO, body);
       }
     },
     error: e => say('camera: ' + e.message)
@@ -438,7 +499,7 @@ async function cameraDo(on) {
 }
 
 function stop() {
-  try { ws && ws.send(head(LEAVE, room, me, 0)); } catch (e) {}
+  try { ws && ws.send(head(LEAVE)); } catch (e) {}
   clearInterval(beat);
   camera(false);
   if (ws) ws.close();
@@ -453,7 +514,7 @@ $('join').onclick = start;
 $('leave').onclick = stop;
 $('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', !muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
 $('cam').onclick = () => camera(!camOn);
-window.addEventListener('beforeunload', () => { try { ws && ws.send(head(LEAVE, room, me, 0)); } catch (e) {} });
+window.addEventListener('beforeunload', () => { try { ws && ws.send(head(LEAVE)); } catch (e) {} });
 </script>
 </body>
 </html>

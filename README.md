@@ -22,6 +22,8 @@ hush kitchen -s host:port # through a particular relay
 hush kitchen --no-aec     # without the echo canceller
 ```
 
+The room's name is also the key to the call, so pick one nobody would guess. See [The lock](#the-lock).
+
 | Key | Does |
 |---|---|
 | `m` | Mute, and unmute |
@@ -69,7 +71,8 @@ Open <https://isene.com/hush/>, type the room and a name, and you are in the cal
 
 - The browser gives the microphone, the camera, Opus, H.264 and echo cancellation. None of it has to be built.
 - The same gate runs there: nothing goes out while you are quiet, and a still picture sends nothing.
-- A browser cannot send UDP, so it reaches the relay over a WebSocket instead. The packets are the same bytes.
+- A browser cannot send UDP, so it reaches the relay over a WebSocket instead. The packets are the same bytes, sealed the same way.
+- The page must come over `https`. A browser seals nothing on a plain `http` page.
 - It needs WebCodecs, which Chrome, Edge and Safari 17 have.
 
 The page is one file, `web/index.html`. Serve it anywhere, as long as the relay is reachable at `ws` beside it.
@@ -105,7 +108,26 @@ myserver.example.com:7777
 
 The relay keeps nothing. A packet arrives, goes out to the others in the same room, and is forgotten.
 
-It never decodes anything, so it never hears what you said. It holds a name and an address for thirty seconds at a time, and no longer.
+It could not listen if it tried: every packet is sealed with a key the relay never has. It keeps a name and an address for thirty seconds at a time, and no longer.
+
+## The lock
+
+What you say and show is sealed on your machine and opened only at the far end.
+
+- The key is made from the room's name. Whoever knows the name is in the call, and nobody else can listen.
+- The relay cannot open a packet, and neither can a network on the way.
+- The relay never gets the room's name. It gets twelve letters made from it, enough to put the same callers together.
+- A packet that was changed on the way is thrown out.
+
+So the room's name is the password. `kitchen` is a name anyone would try. `kitchen-otter-4471` is not.
+
+Making the key takes 600,000 rounds of hashing, about a tenth of a second. That slows down someone who tries names one by one. It does not stop them.
+
+Three things stay readable: that a call takes place, between which addresses, and the names the callers took.
+
+The seal is AES-256-GCM and the key comes from PBKDF2 with SHA-256, both from the RustCrypto crates. Every browser has both built in, so the web page uses its own.
+
+A hush from before 0.4 seals nothing, so it cannot join a call with one that does.
 
 ## The gate
 
@@ -120,7 +142,7 @@ The meter on screen shows your level with the threshold marked on it, so you can
 
 ## What it costs
 
-Speech is about 20 kbit/s while it flows. A packet a second goes out during silence, to hold the way open through both routers, and that is 33 bytes.
+Speech is about 20 kbit/s while it flows. The seal adds 28 bytes to a packet, which is 11 kbit/s more while you speak. A packet a second goes out during silence, to hold the way open through both routers, and that is 33 bytes.
 
 ## Install
 
