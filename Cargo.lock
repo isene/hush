@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.76"
+version = "0.1.79"
 dependencies = [
  "crossterm",
  "libc",
@@ -354,7 +354,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hush"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "audiopus",

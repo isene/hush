@@ -1183,7 +1183,7 @@ fn screen(
                 }),
                 // The keys come first: a narrow window cuts the bar's end.
                 style::dim(if aec { "echo cancelled" } else { "no echo cancelling · wear headphones" }),
-                style::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+                crust::version_tag("hush", env!("CARGO_PKG_VERSION"))
             ));
         }
         std::io::stdout().flush().ok();
