@@ -16,7 +16,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # 24.04, not latest: a binary built on a newer Ubuntu needs a newer glibc
+            # than Debian 13 and Ubuntu 24.04 have, and will not start there.
+            os: ubuntu-24.04
             artifact: hush-linux-x86_64
 
     steps:
